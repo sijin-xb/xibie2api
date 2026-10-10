@@ -425,7 +425,7 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		if !ok {
 			continue
 		}
-		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+		if hasStructuredToolCalls(msg) {
 			continue
 		}
 		if fr, _ := c["finish_reason"].(string); fr != "stop" {
@@ -445,6 +445,23 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		c["finish_reason"] = "tool_calls"
 	}
 	return r
+}
+
+// hasStructuredToolCalls 报告 message 是否已带结构化 tool_calls。
+//
+// 关键：upstream.Aggregate 在内存里把 tool_calls 存为 []map[string]any（见 sse.go），
+// 而修复层自产 / JSON 解码路径是 []any——两种都要认，否则「不覆盖真实调用」的守卫会
+// 失效（finish_reason 恰为 stop 时，真实结构化调用会被标记修复覆盖，与 responses
+// 非流式丢调用同类）。
+func hasStructuredToolCalls(msg map[string]any) bool {
+	switch tcs := msg["tool_calls"].(type) {
+	case []any:
+		return len(tcs) > 0
+	case []map[string]any:
+		return len(tcs) > 0
+	default:
+		return false
+	}
 }
 
 // markupMessageToolCalls 把还原出来的调用转成**非流式** message.tool_calls 数组。

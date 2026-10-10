@@ -363,6 +363,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
+| `logging.request_client_info` | `true` | 是否在请求日志里记录调用来源（客户端 IP / User-Agent）；比 token 计数敏感（IP 属个人信息），共享部署可关。热生效 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
@@ -370,26 +371,39 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日本地时区整点夜猫子补足（23:00–08:00 计数窗口） |
+| `schedule.growth_hours` | `[1]` | 每日本地时区整点自动扫描并执行成长任务队列（Sequential 族每日零点解锁，01:00 自动跑） |
 | `schedule.checkin_enabled` | `true` | 签到总开关；`false` 真正关闭 |
 | `schedule.travel_enabled` | `true` | 猫猫旅行总开关（独立于签到） |
 | `schedule.activity_enabled` | `true` | 活跃上报总开关 |
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
+| `schedule.growth_enabled` | `true` | 成长任务自动排程总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `schedule.balance_refresh_enabled` | `true` | 余额后台周期刷新总开关；两次签到时点之间保持 credits 新鲜，余额恢复的冷却账号自动解冻 |
+| `schedule.balance_refresh_minutes` | `5` | 余额刷新周期（分钟）；`<=0` 回落 `5` |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 内置默认三段式 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`；global 账号第二段为 `WorkBuddy AI`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
+| `upstream.client_version` | 空 | 出站 UA 的 `WorkBuddy/<ver>` 段与 `X-IDE-Version`；空 = 内置默认 `5.5.4`（对齐官方分发包） |
+| `upstream.cli_version` | 空 | 出站 UA 的 `CLI/<ver>` 段；空 = 内置默认 `2.137.1`（官方内置 CLI） |
+| `upstream.client_name` | 空 | 用量归属头取值（`X-Product` / `X-IDE-Name` / `X-IDE-Type` / `X-IDE-Version`）；空 = 默认 `WorkBuddy`（对齐官方桌面端四头）；配 `SaaS` 还原旧行为（仅 `X-Product=SaaS`） |
+| `upstream.device_token` | 空 | `X-Device-Token` 设备风控头全局兜底；空 = 不注入（每号 auth 文件的 `device_token` 优先） |
+| `upstream.device_token_file` | 空 | device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存） |
+| `upstream.passthrough_ip` | `false` | 是否把客户端 IP 透传给上游（`X-Forwarded-For` / `X-Real-IP` / `X-Client-IP`）；默认 false，反代安全边界 |
+| `global.enabled` | `true` | global realm 路由开关（国际版账号判为 global 并路由 global base/路径）；`false` = 纯 CN 锁定逃生门 |
+| `global.chat_base` | 空 | 国际版上游聊天 base 覆盖；空 = 内置默认 `https://www.workbuddy.ai` |
+| `global.billing_base` | 空 | 国际版上游 billing base 覆盖；空 = 内置默认 `https://www.workbuddy.ai` |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
-| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
-| `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
+| `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough`（默认）= 透传客户端原始 system（降级重试仍切中性提示词） |
+| `prompt.file` | 空 | 提示词文件路径（相对路径基准 = 进程工作目录；systemd 单元 `WorkingDirectory` = 安装目录，即 `config.json` 同目录）；空 = 内置默认（约 2KB）；路径非空但不可读**或内容为空/纯空白** → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
 | `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
-| `pool.credit_floor` | `100` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭 |
+| `pool.credit_floor` | `0` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭（内置默认）；`config.example.json` 示例取 `100` 作为推荐值 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
@@ -400,6 +414,28 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
+| `model_aliases` | `[]` | **模型别名映射**（#5）：数组，元素 `{"from":"外部模型名","to":"网关目标模型名"}`。精确匹配；命中后把请求模型名替换为 `to`（可带 `cn:`/`global:` 前缀或裸名），再走既有 realm 解析与选号/策略管线。空/缺省 = 无别名（行为不变）。`from` 不得含 `:`；重复 `from`、`from` 含 `:`/空白/`*`、`to` 为空或含空白/`*`、链式别名均在启动/保存时**报错**（fail fast） |
+
+### 模型别名映射（`model_aliases`）
+
+让 Claude Code / Codex 等客户端发来的厂商模型名（如 `claude-sonnet-4-5`、`gpt-5`）映射到网关实际支持的模型，客户端无需改配置：
+
+```json
+"model_aliases": [
+  { "from": "claude-sonnet-4-5", "to": "cn:glm-5.3" },
+  { "from": "gpt-5", "to": "global:deepseek-v4.1-flash" }
+]
+```
+
+规则与优先级：
+
+- **仅精确匹配**（大小写敏感），不支持前缀/通配；未命中即原样透传。
+- 匹配发生在 **realm 前缀解析之前**：命中后整串替换为 `to`，再交给既有解析与管线。
+- `from` 不得含 `:`（带 `cn:`/`global:` 前缀的模型名由网关直接解析，不走别名）。
+- 别名只决定「用哪个模型」；选号、账号策略、脱敏、提示词改写、出站传输全部沿用既有管线，**不绕过任何安全处理**。
+- 单跳：`to` 不能是另一个别名的 `from`（不支持链式）。
+
+校验（启动 / 面板保存配置时 fail fast，不静默忽略）：`from`/`to` 为空、`from` 含 `:`/空白/`*`、`to` 含空白/`*`、`from` 重复（映射冲突）、`to` 解析后为空、链式别名。目标模型是否真实存在由上游运行时判定（未知模型走上游错误码与既有错误提示链路）。
 
 ### 上游超时语义（三段各归其位）
 
@@ -415,7 +451,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_CLIENT_VERSION` · `WB2A_CLI_VERSION` · `WB2A_CLIENT_NAME` · `WB2A_DEVICE_TOKEN` · `WB2A_DEVICE_TOKEN_FILE` · `WB2A_PASSTHROUGH_IP`(bool) · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_EXPIRING_SOON`(duration) · `WB2A_PREFER_EXPIRING`(bool)
 
 ## 核心行为语义
 
@@ -428,11 +464,16 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 | 模式 | 语义 |
 |---|---|
-| `custom`（默认） | 出站前用网关自有提示词**替换**客户端 system / developer 消息（删除全部 system / developer，头部插入单条 system）；user / assistant / tool 消息逐字不动 |
+| `passthrough`（默认） | 透传客户端原始 system，不做改写 |
+| `custom` | 出站前用网关自有提示词**替换**客户端 system / developer 消息（删除全部 system / developer，头部插入单条 system）；user / assistant / tool 消息逐字不动 |
 | `append` | 开头连续 system / developer 块之后**插入**一条网关自有 system，既有消息（含客户端项目规范/工具约定）逐字不动——两者并用；降级期退化为 replace（带指纹原文重试只会确定性再撞 400） |
-| `passthrough` | 透传客户端原始 system，不做改写 |
 
-内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
+内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认，**无需改 Go 源码即可维护提示词文本**。
+
+- **路径基准**：相对路径按**进程工作目录**解析。systemd 用户单元的 `WorkingDirectory` 为安装目录（`~/.local/share/workbuddy2api-panel`），与 `config.json` 同目录，故 `"file": "./system-prompt.md"` 落在该目录（与 `auth_dir`、`state_file` 同一约定）。
+- **读取时机**：提示词文件在**配置加载期**读取一次（启动时，或面板热重载配置时）。运行期直接改文件内容不生效，需重启进程；`prompt.mode` / `prompt.file` 属于**重启生效**字段（面板保存后会提示）。
+- **失败处理（全部 fail fast，不静默回落）**：`mode` 非法 → 启动报错；`file` 非空但**不存在/不可读** → 启动报错；`file` 存在但**内容为空或纯空白** → 启动报错（否则 handler 的空串守卫会让它静默退化为 passthrough）。**留空 `file`** = 用内置默认提示词。
+- **与脱敏的顺序**：网关提示词改写发生在**出站前、账号轮转前**（`prompt.Rewrite` / `prompt.Append`，每请求一次）；随后上游客户端 `PrepareBody` 才对整个 messages（含网关注入的 system）执行指纹脱敏与字段归一化。即**改写在前、脱敏在后**，两层叠加。轮转 / 换号 / 降级重试复用同一份已改写 body（降级分支用 replace 语义的 `Rewrite`，不会重复追加）。
 
 ### 内容拦截误报与降级重试
 
@@ -615,7 +656,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - 每自然日 1 次派出：按 CST（Asia/Shanghai）自然日重置，与容器 `TZ` 无关
 - 失败隔离：单账号失败只跳过该账号当趟；401 不强刷（token 刷新交保活时点）
 
-## API 端点
+#### 余额后台刷新（独立排程）
 
 **余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
 
@@ -659,7 +700,9 @@ http://127.0.0.1:7863/panel/
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
-涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
+涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`prompt.mode`、`prompt.file`、
+`session_sticky.ttl`、`session_sticky.gc_interval`、`logging.request_archive_enabled`、`logging.request_retention_days`、
+`logging.request_archive_max_mb`、`server.read_timeout`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
 
@@ -687,8 +730,10 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游自然返回错误） |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API 兼容（Codex 客户端直连）；流式/非流式；归一化为 Chat Completions 复用同一条执行管线；错误信封为 Responses 形态 `{"error":{"message","type","param","code"}}` |
+| `POST /v1/messages` | Bearer（`api_key` 非空时） | Anthropic Messages API 子集（Claude 客户端直连）；流式/非流式；复用同一条执行管线。支持矩阵见「Anthropic Messages 兼容」 |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 10min；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
@@ -710,6 +755,34 @@ http://127.0.0.1:7863/panel/
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 - 正文里的原生工具调用标记在透传前还原为 `delta.tool_calls`（见「原生工具调用标记还原」）：命中时一帧会拆成「正文帧 + N 个调用帧 + 收尾帧」，上游的 `finish_reason: stop` 改写为 `tool_calls` 且排在调用帧之后；未命中时逐字节透传
+
+### Anthropic Messages 兼容（`POST /v1/messages`）
+
+网关把 Anthropic Messages 请求归一化为内部 OpenAI Chat Completions 请求体，复用同一条执行管线（别名 / realm / 提示词 / 脱敏 / 选号 / 出站传输），因此两条协议不会漂移。
+
+**支持字段**（→ 出站 OpenAI body）：
+
+| Anthropic | 说明 |
+|---|---|
+| `model` | 原始客户端串；别名 / `cn:`/`global:` 前缀解析照常 |
+| `max_tokens` | **必填**，正整数（缺失/非正/非整数 → 400） |
+| `messages` | 角色 `user`/`assistant`；`content` 为字符串或块数组 |
+| `system` | 字符串，或 `{type:"text",text}` 块数组（按序拼接）→ 前置一条 `system` |
+| `stream` | 缺省 `false` |
+| `temperature` / `top_p` | 同名转发 |
+| `stop_sequences` | → OpenAI `stop` |
+| `tools` | `{name,description,input_schema}` → `{type:"function",function:{...}}` |
+| `tool_choice` | `{type:"auto"}`→`auto`；`{type:"any"}`→`required`；`{type:"none"}`→`none`；`{type:"tool",name}`→`{type:"function",function:{name}}` |
+
+消息块映射：`text`→文本；`image`（`source.type` 为 `base64`/`url`）→`image_url`；assistant 的 `tool_use`→`tool_calls`；user 的 `tool_result`→`role:"tool"` 消息（顺序保持，绝不当成用户文本）。
+
+**接受但不转发**：`metadata`（含 `metadata.user_id`）——接受并忽略。
+
+**明确拒绝（400 `invalid_request_error`，命名该字段）**：`top_k`、`thinking`、`output_config`、`container`、`mcp_servers`、`context_management`、`service_tier`、未知内容块 `type`、未知 `tool_choice.type`、字段类型错误。这些字段会改变生成语义而上游 OpenAI 形态无法表达——网关无状态，拒绝而非静默丢弃。
+
+**响应**：非流式返回 Anthropic `message` 对象（`content` 文本 / `tool_use` 块、`stop_reason`、`usage.input_tokens`/`output_tokens`）；流式返回标准事件序列 `message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（可多个块，index 单调）→ `message_delta` → `message_stop`。上游 error 帧映射为 `event: error`。`stop_reason` 映射：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`、`content_filter`→`refusal`、未知/空→`end_turn`；`stop_sequence` 恒为 `null`（上游 OpenAI 形态无法识别命中哪条 stop 序列）。错误信封为 `{"type":"error","error":{"type":"<...>","message":"..."}}`（按 HTTP 状态映射类型；Anthropic 无 `gateway_hint` 字段，网关 hint 折进 `message`）。
+
+> 已知限制：流式 `message_start.usage.input_tokens` 取发出时已观测到的值——上游通常在**末帧**才给 usage，故流式下多为 0，`output_tokens` 以 `message_delta` 的末帧 usage 为准（不伪造）。
 
 ### 上游端点
 
@@ -743,7 +816,7 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/accept` | POST | 接受任务（`{"task_codes":[...]}`） |
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
-出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+出站请求统一携带 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1` UA（global 账号第二段为 `WorkBuddy AI`；可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
 ## 请求级日志
 
@@ -896,38 +969,37 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 系统提示词被内容策略误杀怎么办？
 
-默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
+默认 `prompt.mode=passthrough`（透传客户端原始 system）。若改用 `prompt.mode=custom`，网关会用自有提示词替换客户端 system，从源头消除大部分 system 来源误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1` 现状（指纹净化考虑，可配而非改死）。
 
 ## 关键断言 ↔ 代码出处
 
 | 断言 | 出处 |
 |---|---|
-| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段 |
-| 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
-| DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
-| 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
-| `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:54` |
+| `prompt.mode` 默认 `passthrough` | `cmd/server/config.go`（`Default()` 设 passthrough，`normalizePrompt` 校验） |
+| 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段（`io.ReadAll`，无 `MaxBytesReader`） |
+| 出站强制 `stream:true` | `internal/upstream/payload.go:38`（`PrepareBodyOptWithEffortsAndDefault`） |
+| DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:156`（`injectThinking`） |
+| 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32`（`defaultDeepSeekEffort`） |
+| `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:70`（`backfillReasoningContent`） |
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
-| 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
-| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
-| session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
-| `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
-| disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
-| 硬冷却至次日 04:00 | `internal/pool/pool.go:882`（`CooldownUntilTomorrow4AM`） |
-| 软冷却退避封顶 2h | `internal/pool/pool.go:247`（`defaultSoftRateMax`） |
-| Top-5 候选短名单 | `internal/pool/pool.go:584` |
-| `activity_hours` 默认 `[10]` | `cmd/server/config.go:135` |
-| 活跃自检回读 streak | `internal/scheduler/scheduler.go:227`（`checkActivityStreak`） |
-| streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（常量）、`:139`（`GrowthStreak`） |
-| Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:21` |
-| 静态模型表含 `deepseek-v4-flash` 等 | `internal/server/handler.go:146` |
+| 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:214`（`modelRateLimitCode`）、`:435`（`ParseRateReset`） |
+| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:159`（`badParamsMarkerMsg`）、`:202`（`badParamsMarkerCode`）；处理分支 `internal/server/handler.go`（`applyErrorPolicy` 的 `ErrBadParams`） |
+| 出站 UA 覆盖（空 = 内置默认 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go`（`upstream.user_agent`）；接线 `cmd/server/main.go`（`up.UserAgent`） |
+| session-dead 连续阈值 3 才禁用 | `internal/pool/entry.go:530`（`sessionDeadThreshold`） |
+| `ReviveDisabled` 人工复活 | `internal/pool/state.go:62` |
+| disabled 账号透出 `disabled_reason` | `internal/pool/entry.go:92`（`DisabledReason` 字段）、`internal/pool/state.go:578`（写入） |
+| 硬冷却至次日 04:00 | `internal/pool/cooldown.go:464`（`CooldownUntilTomorrow4AM`） |
+| 软冷却退避封顶 2h | `internal/pool/entry.go:510`（`defaultSoftRateMax`） |
+| Top-5 候选短名单 | `internal/pool/pick.go`（`pick` 的 top5 短名单截断） |
+| `activity_hours` 默认 `[10]` | `cmd/server/config.go`（`Default()`） |
+| 活跃自检回读 streak | `internal/scheduler/scheduler.go:559`（`checkActivityStreak`） |
+| streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（`streakPath` 常量）、`:139`（`GrowthStreak`） |
+| Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:22`（`keyTTL`） |
 
 ## 免责声明
 

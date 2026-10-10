@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 )
 
 // Config 顶层配置。
@@ -213,6 +214,11 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// ModelAliases 模型别名表（#5）：外部模型名 → 网关实际支持的模型名（可带
+	// cn:/global: 前缀）。精确匹配；缺省空 = 无别名，行为与引入前一致。
+	// 校验与构建见 normalize（非法配置 fail fast，不静默忽略）。
+	ModelAliases []server.ModelAlias `json:"model_aliases,omitempty"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -228,6 +234,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// AliasTable 解析后的别名表（normalize 构建）；nil = 无别名。
+	AliasTable *server.AliasTable `json:"-"`
 }
 
 // Default 默认配置。
@@ -594,6 +602,13 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	// 模型别名表（#5）：空 = 无别名（AliasTable 保持 nil，行为不变）；非空则逐条
+	// 校验并构建，非法配置 fail fast（重复 from / from 含 ':' / 空值 / 链式别名等）。
+	tbl, err := server.NewAliasTable(c.ModelAliases)
+	if err != nil {
+		return err
+	}
+	c.AliasTable = tbl
 	return c.normalizePrompt()
 }
 
@@ -601,8 +616,13 @@ func (c *Config) normalize() error {
 //
 // mode 非法（非 passthrough/custom/append）启动报错，避免静默回落到某一分支；
 // custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
-// （两模式共用同一加载路径，PromptText 均非空）。
+// （两模式共用同一加载路径，PromptText 均非空）；文件存在但内容为空/纯空白 → 同样
+// 报错：否则 handler 的 PromptText != "" 守卫会失效，静默退化为 passthrough（客户端
+// system 原样出站），与「不静默回落」原则冲突。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+//
+// 提示词文件在**配置加载期**读取一次（启动或热重载配置时）；运行期改文件内容不生效，
+// 需重启进程（见 main.go restartRequiredFields 的 prompt.mode / prompt.file）。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":
@@ -618,6 +638,12 @@ func (c *Config) normalizePrompt() error {
 		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
 		if err != nil {
 			return err
+		}
+		if strings.TrimSpace(text) == "" {
+			if c.Prompt.File != "" {
+				return fmt.Errorf("prompt.file %s 内容为空：custom/append 模式需要非空提示词（填写内容、留空 file 用内置默认，或改用 passthrough）", c.Prompt.File)
+			}
+			return fmt.Errorf("prompt: 内置默认提示词为空（构建异常）")
 		}
 		c.PromptText = text
 	}

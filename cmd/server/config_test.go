@@ -859,3 +859,66 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestPromptCustomEmptyFileFailsFast custom 模式下 file 存在但内容为空 → 启动报错。
+// Load 对空文件返回 ("", nil)，非空校验必须由配置层完成：否则 handler 的
+// PromptText != "" 守卫失效、静默退化为 passthrough（客户端 system 原样出站）。
+func TestPromptCustomEmptyFileFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "empty.md")
+	if err := os.WriteFile(pf, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cf := filepath.Join(dir, "c.json")
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
+	if _, err := Load(cf); err == nil {
+		t.Fatal("custom mode with empty prompt file must fail fast")
+	}
+}
+
+// TestPromptAppendWhitespaceFileFailsFast append 模式下 file 内容为纯空白 → 启动报错
+// （TrimSpace 判定，与空文件同一条路径）。
+func TestPromptAppendWhitespaceFileFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "blank.md")
+	if err := os.WriteFile(pf, []byte("\n  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cf := filepath.Join(dir, "c.json")
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "append", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
+	if _, err := Load(cf); err == nil {
+		t.Fatal("append mode with whitespace-only prompt file must fail fast")
+	}
+}
+
+// TestPromptCustomValidFileLoads custom 模式 file 内容非空 → 无错且 PromptText
+// 逐字等于文件内容。（与既有 TestPromptFileOverride 同口径，此处独立锁定文案。）
+func TestPromptCustomValidFileLoads(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "ok.md")
+	want := "这是我的提示词"
+	if err := os.WriteFile(pf, []byte(want), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cf := filepath.Join(dir, "c.json")
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != want {
+		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
