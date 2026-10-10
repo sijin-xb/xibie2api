@@ -45,13 +45,19 @@ type responsesRenderer struct {
 // hint 被忽略：Responses 无 gateway_hint 帧形态（错误以 event: error 表达）。
 func (r responsesRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 	_ func() upstream.HintContext, repair *upstream.MarkupRepair, onErrorFrame func(string)) error {
+	// 推理静默期补 SSE 注释心跳：上游可能数分钟不发 data 帧，客户端按字节空闲
+	// 判流断开（Codex "idle timeout waiting for SSE"）会腰斩长回合。见 keepalive.go。
+	// 先设响应头再启心跳：心跳可能在任何 data 帧之前发出（静默期正是要覆盖的场景），
+	// 若此时头未定，首次 Write 会以默认 Content-Type 提前提交响应头。
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	fl, _ := w.(http.Flusher)
-	sink := newResponsesSink(w, fl, r.meta)
+	k := newSSEKeepalive(w, sseKeepaliveInterval)
+	defer k.Close()
+	var fl http.Flusher = k
+	sink := newResponsesSink(k, fl, r.meta)
 	return upstream.PumpFrames(stats, sink,
 		upstream.WithMarkupRepair(repair),
 		upstream.WithErrorFrameObserver(onErrorFrame))

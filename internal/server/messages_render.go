@@ -31,13 +31,17 @@ type messagesRenderer struct {
 // hint 被忽略：Anthropic 无 gateway_hint 帧形态（错误以 event: error 表达）。
 func (r messagesRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 	_ func() upstream.HintContext, repair *upstream.MarkupRepair, onErrorFrame func(string)) error {
+	// 推理静默期补 SSE 注释心跳（见 keepalive.go）：Anthropic 客户端同样按字节
+	// 空闲判流断开，长思考回合需要保活。先设头再启心跳（同 responses 路径）。
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	fl, _ := w.(http.Flusher)
-	sink := newMessagesSink(w, fl, r.meta)
+	k := newSSEKeepalive(w, sseKeepaliveInterval)
+	defer k.Close()
+	var fl http.Flusher = k
+	sink := newMessagesSink(k, fl, r.meta)
 	return upstream.PumpFrames(stats, sink,
 		upstream.WithMarkupRepair(repair),
 		upstream.WithErrorFrameObserver(onErrorFrame))
