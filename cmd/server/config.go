@@ -127,7 +127,9 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
-		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 1800。
+		// 取值需覆盖模型最长推理静默：deepseek-v4.1-flash 实测静默 >300s，旧默认 300
+		// 会在长思考回合把上游读掐掉（日志 "upstream read error: context canceled"）。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
@@ -566,8 +568,9 @@ func (c *Config) normalize() error {
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
 		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
 	}
+	// 默认 1800s：覆盖长推理静默（实测 >300s）。活跃吐数据续命，只有真死连接才断。
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
-		c.Upstream.IdleTimeoutSeconds = 300
+		c.Upstream.IdleTimeoutSeconds = 1800
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

@@ -287,7 +287,7 @@ func TestBadBreakerCooldown(t *testing.T) {
 }
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
-	// 默认：header 回落 timeout，idle 回落 300。
+	// 默认：header 回落 timeout，idle 回落 1800。
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -298,13 +298,13 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 	if c.Upstream.HeaderTimeoutSeconds != 120 {
 		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
 	}
-	if c.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	if c.Upstream.IdleTimeoutSeconds != 1800 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1800", c.Upstream.IdleTimeoutSeconds)
 	}
 }
 
 func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+	// 只设 timeout_seconds：header 回落同值，idle 回落 1800。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
@@ -315,8 +315,8 @@ func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
 	if c.Upstream.HeaderTimeoutSeconds != 60 {
 		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
 	}
-	if c.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	if c.Upstream.IdleTimeoutSeconds != 1800 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1800", c.Upstream.IdleTimeoutSeconds)
 	}
 }
 

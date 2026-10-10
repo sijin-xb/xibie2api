@@ -37,7 +37,17 @@ type openAIRenderer struct{}
 
 func (openAIRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 	hint func() upstream.HintContext, repair *upstream.MarkupRepair, onErrorFrame func(string)) error {
-	return upstream.StreamHint(w, stats, upstream.FrameHintFunc(hint),
+	// 推理静默期补 SSE 注释心跳（见 keepalive.go）：与 responses/messages 路径同
+	// 语义，避免客户端在长思考回合按空闲超时腰斩。先设头再启心跳，避免心跳在
+	// StreamHint 设头之前以默认 Content-Type 提前提交响应头。
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	k := newSSEKeepalive(w, sseKeepaliveInterval)
+	defer k.Close()
+	return upstream.StreamHint(k, stats, upstream.FrameHintFunc(hint),
 		upstream.WithErrorFrameObserver(onErrorFrame),
 		upstream.WithMarkupRepair(repair))
 }

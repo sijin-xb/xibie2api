@@ -383,7 +383,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.balance_refresh_minutes` | `5` | 余额刷新周期（分钟）；`<=0` 回落 `5` |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
-| `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `upstream.idle_timeout_seconds` | `1800` | 聊天流中空闲上限（活跃续命，静默断流）；需覆盖模型最长推理静默，长思考模型实测静默 >300s |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 内置默认三段式 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`；global 账号第二段为 `WorkBuddy AI`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `upstream.client_version` | 空 | 出站 UA 的 `WorkBuddy/<ver>` 段与 `X-IDE-Version`；空 = 内置默认 `5.5.4`（对齐官方分发包） |
 | `upstream.cli_version` | 空 | 出站 UA 的 `CLI/<ver>` 段；空 = 内置默认 `2.137.1`（官方内置 CLI） |
@@ -443,7 +443,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|---|
 | `timeout_seconds` | 短 RPC（token 刷新 / 签到 / 余额 / 模型列表） | `120` | 总时长硬上限，到期报错走换号 / 熔断 |
 | `header_timeout_seconds` | 聊天 SSE **首字节前** | `120` | 由 `Transport.ResponseHeaderTimeout` 约束；超时 = 换号重发 |
-| `idle_timeout_seconds` | 聊天 SSE **流中空闲** | `300` | 活跃吐数据续命不掐；静默超时才断流释放租约 |
+| `idle_timeout_seconds` | 聊天 SSE **流中空闲** | `1800` | 活跃吐数据续命不掐；静默超时才断流释放租约。默认 1800s 覆盖长推理静默（实测 >300s），太小会在长思考回合误掐上游读 |
 
 聊天流（`stream` true / false 均同）**没有总时长上限**：聊天使用 `Timeout=0` 的专用 client，长思考 / 长输出不会被掐断。
 
