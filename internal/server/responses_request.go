@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -435,6 +436,7 @@ func mapResponsesTools(tools []any) ([]any, *responsesError) {
 		return nil, nil
 	}
 	out := make([]any, 0, len(tools))
+	var skipped []string
 	for i, t := range tools {
 		tool, ok := t.(map[string]any)
 		if !ok {
@@ -442,7 +444,11 @@ func mapResponsesTools(tools []any) ([]any, *responsesError) {
 		}
 		typ, _ := tool["type"].(string)
 		if typ != "function" {
-			return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: only type \"function\" is supported", i))
+			// 客户端（如 Codex）会携带上游无法表达的内置工具：type:"namespace"
+			// （多智能体容器）、type:"web_search" 等。上游只支持 function 工具，
+			// 这类工具无法无损转发——跳过并告警，而不是让整个请求 400（否则 Codex 不可用）。
+			skipped = append(skipped, typ)
+			continue
 		}
 		var fn map[string]any
 		if inner, ok := tool["function"].(map[string]any); ok {
@@ -467,6 +473,9 @@ func mapResponsesTools(tools []any) ([]any, *responsesError) {
 			return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: function name is required", i))
 		}
 		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	if len(skipped) > 0 {
+		log.Printf("WARN: [server] responses: skipped %d non-function tool(s) the upstream cannot express: %v", len(skipped), skipped)
 	}
 	return out, nil
 }
