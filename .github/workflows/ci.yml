@@ -1,0 +1,53 @@
+name: ci
+
+# 质量门禁（与发布线解耦，不发布任何产物）：
+#   - push main / PR → gofmt + go vet + go test + go build
+#
+# Go 版本取 go.mod（go-version-file），保证 CI 的 gofmt 与仓库口径一致：
+#   不同 Go 版本的 gofmt 结论可能不同（例如 1.27 会额外标记某些文件），
+#   本仓库以 go.mod 声明的版本为准。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# PR 取消过时运行；main 按引用串行，避免同一分支并发。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# 最小权限：仅需读取仓库内容。
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt，请运行 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt OK"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: go build
+        run: go build ./...
