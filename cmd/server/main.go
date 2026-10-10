@@ -310,6 +310,8 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 模型别名表（#5）：外部模型名 → 网关目标模型名的精确匹配；nil = 无别名。
+		ModelAliases: cfg.AliasTable,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -531,6 +533,10 @@ func restartRequiredFields(c *Config) []string {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
+	// prompt.mode / prompt.file 在装配期被 NewHandler 捕获为静态 PromptText，
+	// 不在 livecfg 热快照里；此前漏列会让面板改完提示词显示「已保存」却不生效，
+	// 用户以为没改成功。提示词文本的读取时机是配置加载期，改后需重启。
+	out = append(out, "prompt.mode", "prompt.file")
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")

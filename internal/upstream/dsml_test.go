@@ -461,6 +461,27 @@ func TestRepairAggregatedResponseSkips(t *testing.T) {
 	}
 }
 
+// TestRepairAggregatedResponseSkipsMapShape 回归：聚合响应里 tool_calls 的真实内存形态
+// 是 []map[string]any（upstream.Aggregate 构造，见 sse.go）。守卫必须认这种形态，
+// 否则「已有结构化 tool_calls → 不覆盖」失效，finish_reason 恰为 stop 且正文含标记时
+// 真实调用会被标记修复覆盖。
+func TestRepairAggregatedResponseSkipsMapShape(t *testing.T) {
+	markup := mkBlock(mkInvoke("exec_command", mkParam("cmd", "ls -la")))
+	resp := aggregatedResponse(markup, "stop")
+	real := map[string]any{"id": "real", "type": "function", "function": map[string]any{"name": "real_tool"}}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	msg["tool_calls"] = []map[string]any{real}
+
+	r := RepairAggregatedResponse(resp, testTools, false)
+	if r.Converted() != 0 {
+		t.Fatalf("已有 []map[string]any 形态 tool_calls 时不得改写，converted=%d", r.Converted())
+	}
+	tcs, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(tcs) != 1 || tcs[0]["id"] != "real" {
+		t.Fatalf("真实结构化调用被覆盖: %#v", msg["tool_calls"])
+	}
+}
+
 // --- 弱判定（名单为空，实测最常见的泄漏形态）--------------------------------
 
 // TestMarkupRepairWeakModeRealSample 生产场景回归：请求体里没有 tools 名单（tools 在

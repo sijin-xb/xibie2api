@@ -28,6 +28,18 @@ func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) 
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
+	return AggregateObserved(r, nil)
+}
+
+// AggregateObserved 同 Aggregate，额外提供「上游以 error 帧报错」的观察者：解析到
+// 含 error 键的数据帧（与流式路径 frames.go writeFrame 的检测口径一致）时以原始
+// payload 回调 onErrorFrame。onErrorFrame 为 nil 时与 Aggregate **逐字节一致**：
+// 不改动有效帧计数、不改变返回 map（既有逐字节测试的基线）。
+//
+// 非流式路径此前没有任何 error 帧检测：上游「200 + 仅 error 帧」会被聚合成功，
+// 掩蔽成空 chat.completion（假成功）。调用方（turn.go 非流式分支）用本回调复刻
+// 流式路径的账号处置与错误响应。
+func AggregateObserved(r io.Reader, onErrorFrame func(payload string)) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id, model     string
@@ -156,6 +168,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
 					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 					validEvents++
+					// 上游 error 帧旁路观测（账号处置用）：与流式路径同口径（error 键存在）。
+					// 仅回调，不改变聚合结果——nil 时零行为差异。
+					if _, hasErr := chunk["error"]; hasErr && onErrorFrame != nil {
+						onErrorFrame(payload)
+					}
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
 					}
@@ -524,262 +541,69 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	return pumpFrames(r, &openAISSEWriter{w: w, fl: fl, hintFn: hintFn}, o)
+}
 
-	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
-	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
-	toolCallSeen := map[int]bool{}
+// openAISSEWriter 是 FrameSink 的 OpenAI SSE 实现：只负责把 PumpFrames 交付的
+// 归一化帧/事件编码成 "data: <payload>\n\n" 并 flush，不持有任何跨帧状态。
+type openAISSEWriter struct {
+	w      io.Writer
+	fl     http.Flusher
+	hintFn func(string) string
+}
 
-	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
-	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
-	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
-	firstID := ""
-
-	// 标记修复（见 dsml.go）：把上游正文里的原生工具调用标记还原成 delta.tool_calls。
-	// 客户端没声明过 tools 时 repair.Enabled() 为 false → 整条流零改写零分配。
-	//   - synthIdx：本流已还原的调用数（合成的 index 从上游最大 index 之后接续）；
-	//   - maxToolIdx：上游已用过的最大 tool_call index，避免合成的 index 与真实调用撞车；
-	//   - toolFinishSent：是否已发出过 finish_reason: tool_calls，供流尾兜底。
-	repair := o.markup
-	synthIdx := 0
-	maxToolIdx := -1
-	toolFinishSent := false
-
-	// writeSSE 原样写出一帧并 flush。
-	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
-	}
-
-	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
-	// 与空流错误帧需保留 error 字段，不能被白名单剥掉，故经此写出。
-	// gateway_hint：上游 error 帧透出前按 hintFn 附加 error.gateway_hint 字段
-	// （error 对象上加一个键，message/code/requestId 等原文不动；hintFn 为
-	// nil / 空串 / 非 JSON 帧 → 原样写出，零改写）。
-	writeRaw := func(payload string) error {
-		if hint := frameGatewayHint(hintFn, payload); hint != "" {
-			payload = attachHintToErrorFrame(payload, hint)
-		}
-		return writeSSE(payload)
-	}
-
-	// writeChunk 把一个 chunk 对象按规范白名单重建后写出并 flush，同时维护三件跨帧
-	// 状态：tool_calls name 收敛（每 index 仅首片带 name）、消息 id 续传、以及上游
-	// 已用过的最大 tool_call index（供标记修复接续编号）。
-	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
-	writeChunk := func(obj map[string]any, fallback string) error {
-		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
-		stripToolCallNames(obj, toolCallSeen)
-		// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
-		// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
-		if firstID == "" {
-			if v, ok := obj["id"].(string); ok && v != "" {
-				firstID = v
-			}
-		} else if v, ok := obj["id"].(string); !ok || v == "" {
-			obj["id"] = firstID
-		}
-		if chs, ok := obj["choices"].([]any); ok {
-			for _, ci := range chs {
-				c, _ := ci.(map[string]any)
-				if c == nil {
-					continue
-				}
-				d, _ := c["delta"].(map[string]any)
-				if d == nil {
-					continue
-				}
-				tcs, _ := d["tool_calls"].([]any)
-				for _, tci := range tcs {
-					tc, _ := tci.(map[string]any)
-					if tc == nil {
-						continue
-					}
-					if v, ok := tc["index"].(float64); ok && int(v) > maxToolIdx {
-						maxToolIdx = int(v)
-					}
-				}
-			}
-		}
-		raw, err := json.Marshal(normalizeFrame(obj))
-		if err != nil {
-			return writeSSE(fallback)
-		}
-		return writeSSE(string(raw))
-	}
-
-	// repairFrame 在透传前跑标记修复，并把一帧展开成「可能多帧」：正文帧（标记被摘掉
-	// 后的可见文本）+ N 个 delta.tool_calls 帧 + 收尾 finish_reason 帧。没有命中标记
-	// 时原样返回入参帧（单元素），与修复前逐字节一致。
-	repairFrame := func(obj map[string]any) []map[string]any {
-		if !repair.Enabled() {
-			return []map[string]any{obj}
-		}
-		chs, ok := obj["choices"].([]any)
-		if !ok {
-			return []map[string]any{obj}
-		}
-		var calls []MarkupCall
-		for _, ci := range chs {
-			c, ok := ci.(map[string]any)
-			if !ok {
-				continue
-			}
-			d, ok := c["delta"].(map[string]any)
-			if !ok {
-				continue
-			}
-			txt, ok := d["content"].(string)
-			if !ok || txt == "" {
-				continue
-			}
-			emit, got := repair.Feed(txt)
-			calls = append(calls, got...)
-			if emit == "" {
-				delete(d, "content")
-			} else {
-				d["content"] = emit
-			}
-		}
-		if len(calls) == 0 {
-			// 本帧没命中标记；但本流此前还原过调用 → 把上游的 stop 收尾改写成
-			// tool_calls，客户端据此知道「回合以工具调用结束」而不是「模型只说了话」。
-			if synthIdx > 0 && rewriteFinishReason(obj, "tool_calls") {
-				toolFinishSent = true
-			}
-			return []map[string]any{obj}
-		}
-		// 命中：finish_reason 必须挪到工具调用帧之后，否则客户端在读到调用之前就
-		// 认为回合已经结束。注意「本帧本来没有 finish_reason」时**不得**补一帧收尾
-		// ——上游的收尾帧随后就到，补了会变成两个 finish_reason（后续那个由
-		// rewriteFinishReason 改写）。
-		fr := takeFinishReason(obj)
-		out := []map[string]any{obj}
-		for _, call := range calls {
-			idx := maxToolIdx + 1 + synthIdx
-			synthIdx++
-			out = append(out, markupCallFrame(obj, idx, call))
-		}
-		if fr != "" {
-			if fr == "stop" {
-				fr = "tool_calls"
-			}
-			out = append(out, finishOnlyFrame(obj, fr))
-			toolFinishSent = fr == "tool_calls"
-		}
-		return out
-	}
-
-	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
-	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
-		var obj map[string]any
-		if json.Unmarshal([]byte(payload), &obj) != nil {
-			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
-			if werr := writeSSE(payload); werr != nil {
-				return 0, werr
-			}
-			return 0, nil
-		}
-		// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
-		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
-		// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
-		// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
-		if _, hasErr := obj["error"]; hasErr {
-			// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
-			if o.onErrorFrame != nil {
-				o.onErrorFrame(payload)
-			}
-			if werr := writeRaw(payload); werr != nil {
-				return 0, werr
-			}
-			return 1, nil
-		}
-		for _, ch := range repairFrame(obj) {
-			if werr := writeChunk(ch, payload); werr != nil {
-				return 0, werr
-			}
-		}
-		return 1, nil
-	}
-
-	br := bufio.NewReaderSize(r, 64*1024)
-	validFrames := 0
-readLoop:
-	for {
-		line, err := br.ReadString('\n')
-		trimmed := strings.TrimRight(line, "\r\n")
-		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
-			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
-			// [DONE] 统一在循环结束后写出，保证恰好一个。
-			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
-			validFrames += n
-			if werr != nil {
-				return werr
-			}
-		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
-			}
-			if fl != nil {
-				fl.Flush()
-			}
-		}
-		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-	}
-	// 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，未闭合
-	// 的块连起始标记一起交还）；若本流还原过调用、但上游从未给出收尾帧，补一帧
-	// finish_reason: tool_calls，保证客户端不会把「工具调用回合」读成「模型只说了话」。
-	if repair.Enabled() {
-		if tail := repair.Flush(); tail != "" {
-			tailObj := map[string]any{
-				"object": "chat.completion.chunk",
-				"choices": []any{map[string]any{
-					"index": 0,
-					"delta": map[string]any{"content": tail},
-				}},
-			}
-			if werr := writeChunk(tailObj, ""); werr != nil {
-				return werr
-			}
-			validFrames++
-		}
-		if synthIdx > 0 && !toolFinishSent {
-			if werr := writeChunk(finishOnlyFrame(map[string]any{}, "tool_calls"), ""); werr != nil {
-				return werr
-			}
-		}
-	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
-	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
-	}
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+// writeSSE 原样写出一帧并 flush。
+func (s *openAISSEWriter) writeSSE(payload string) error {
+	if _, err := io.WriteString(s.w, "data: "+payload+"\n\n"); err != nil {
 		return err
 	}
-	if fl != nil {
-		fl.Flush()
+	if s.fl != nil {
+		s.fl.Flush()
 	}
-	if validFrames == 0 {
-		return errEmptyStream
+	return nil
+}
+
+// Chunk 编码一帧已归一化的 chunk；marshal 失败时回退 rawFallback 原文。
+func (s *openAISSEWriter) Chunk(frame map[string]any, rawFallback string) error {
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return s.writeSSE(rawFallback)
+	}
+	return s.writeSSE(string(raw))
+}
+
+// Raw 原样透传一帧 payload（不加 hint）。
+func (s *openAISSEWriter) Raw(payload string) error {
+	return s.writeSSE(payload)
+}
+
+// ErrorFrame 透传上游 error 帧，透出前按 hintFn 附加 error.gateway_hint。
+// hintFn 为 nil / 空串 / 非 JSON 帧 → 原样写出，零改写。
+func (s *openAISSEWriter) ErrorFrame(payload string) error {
+	if hint := frameGatewayHint(s.hintFn, payload); hint != "" {
+		payload = attachHintToErrorFrame(payload, hint)
+	}
+	return s.writeSSE(payload)
+}
+
+// Comment 原样透传非 data、非空的原始行（含换行）并 flush。
+func (s *openAISSEWriter) Comment(line string) error {
+	if _, err := io.WriteString(s.w, line); err != nil {
+		return err
+	}
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+	return nil
+}
+
+// Done 写出流终止标记 [DONE] 并 flush。
+func (s *openAISSEWriter) Done() error {
+	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	if s.fl != nil {
+		s.fl.Flush()
 	}
 	return nil
 }

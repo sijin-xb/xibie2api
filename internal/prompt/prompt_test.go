@@ -222,3 +222,22 @@ func TestLoadFileMissingFailsFast(t *testing.T) {
 		t.Fatal("missing file should return error (fail fast)")
 	}
 }
+
+// TestLoadEmptyFileReturnsEmptyNoError 锁定 Load 的契约：file 非空且可读时，Load
+// 只负责"把文件内容原样交回"，不负责校验内容是否为空——空文件返回 ("", nil)，
+// **不报错**。非空校验由调用方（cmd/server 的 normalizePrompt）承担：否则 handler
+// 的 PromptText != "" 守卫会失效、静默退化为 passthrough。
+func TestLoadEmptyFileReturnsEmptyNoError(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "empty.md")
+	if err := os.WriteFile(fp, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load("custom", fp)
+	if err != nil {
+		t.Fatalf("Load(empty file) should NOT error (config layer validates): %v", err)
+	}
+	if got != "" {
+		t.Errorf("Load(empty file)=%q want empty string", got)
+	}
+}
