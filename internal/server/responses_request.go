@@ -33,6 +33,9 @@ type responsesMeta struct {
 	metadata          any // 接受但不转发
 	parallelToolCalls any // 接受但不转发
 	stream            bool
+	// toolRefs 摊平后的上游 function 名 → Responses 原始工具形态。渲染层据此把
+	// 上游 function_call 还原为 Codex 期望的 item（namespace / custom）。nil = 无需还原。
+	toolRefs map[string]responsesToolRef
 }
 
 // responsesError 归一化/读体阶段的请求级错误（映射为 Responses 错误信封）。
@@ -182,8 +185,9 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 	}
 	messages = append(messages, inMsgs...)
 
-	// tools 映射（Responses 扁平形态 → OpenAI 嵌套 function 形态）。
-	oTools, rerr := mapResponsesTools(tools)
+	// tools 映射（Responses 扁平形态 → OpenAI 嵌套 function 形态）。namespace /
+	// custom 工具会被摊平为上游可表达的 function，并记录还原映射。
+	oTools, toolRefs, rerr := mapResponsesTools(tools)
 	if rerr != nil {
 		return nil, responsesMeta{}, rerr
 	}
@@ -228,6 +232,7 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		metadata:          metadata,
 		parallelToolCalls: parallel,
 		stream:            stream,
+		toolRefs:          toolRefs,
 	}
 	return out, meta, nil
 }
@@ -307,6 +312,10 @@ func normalizeResponsesItem(item any, i int) (any, *responsesError) {
 		return normalizeResponsesFunctionCall(obj, i)
 	case "function_call_output":
 		return normalizeResponsesFunctionCallOutput(obj, i)
+	case "custom_tool_call":
+		return normalizeResponsesCustomToolCall(obj, i)
+	case "custom_tool_call_output":
+		return normalizeResponsesCustomToolCallOutput(obj, i)
 	case "reasoning":
 		// 安全忽略：本网关无 reasoning item 的加密内容/摘要数据，不臆造、不转发。
 		return nil, nil
@@ -388,6 +397,11 @@ func normalizeResponsesFunctionCall(obj map[string]any, i int) (any, *responsesE
 	if strings.TrimSpace(name) == "" {
 		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: function_call.name is required", i))
 	}
+	// 历史回放：namespace 工具在上游侧以 "<ns>__<tool>" 摊平名出现，这里还原成同一
+	// 摊平名，保证历史里的工具名与本轮 tools 声明逐字一致。
+	if ns, _ := obj["namespace"].(string); strings.TrimSpace(ns) != "" {
+		name = flattenNamespaceTool(ns, name)
+	}
 	if _, isStr := obj["arguments"].(string); !isStr && obj["arguments"] != nil {
 		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: function_call.arguments must be a string", i))
 	}
@@ -429,55 +443,200 @@ func normalizeResponsesFunctionCallOutput(obj map[string]any, i int) (any, *resp
 	return map[string]any{"role": "tool", "tool_call_id": callID, "content": content}, nil
 }
 
-// mapResponsesTools 把 Responses 的扁平 function 工具映射为 OpenAI 嵌套形态。
-// 同时接受已嵌套的 {type:"function",function:{...}}。
-func mapResponsesTools(tools []any) ([]any, *responsesError) {
+// namespaceToolSeparator 摊平 namespace 工具时的连接符。上游只认扁平 function 名；
+// Codex 自身对 MCP 工具也用 "mcp__server__tool" 约定，故沿用 "__"。
+const namespaceToolSeparator = "__"
+
+// flattenNamespaceTool 把 (namespace, tool) 拼成上游可表达的扁平 function 名。
+func flattenNamespaceTool(namespace, name string) string {
+	return namespace + namespaceToolSeparator + name
+}
+
+// responsesToolRef 记录摊平后的上游 function 名 → Responses 原始工具形态。
+//   - namespace 非空 = 该 function 由 namespace 容器里的子工具摊平而来；
+//   - custom = true = 该 function 由 type:"custom"（freeform）工具翻译而来。
+type responsesToolRef struct {
+	namespace string
+	name      string
+	custom    bool
+}
+
+// mapResponsesTools 把 Responses 工具定义映射为上游 OpenAI 嵌套 function 形态。
+//   - {type:"function"} → 原样嵌套（含已嵌套形态）；
+//   - {type:"namespace",name,tools} → 每个子工具摊平为 "<ns>__<tool>" function；
+//   - {type:"custom",name,format} → 单参数（input:string）function；
+//   - 其余（type:"web_search" 等上游无法表达的内置工具）→ 跳过并告警。
+//
+// 返回值 refs 以摊平后的上游函数名为键，渲染层据此把 function_call 还原为
+// Codex 期望的 namespace / custom item 形态。
+func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *responsesError) {
 	if tools == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	out := make([]any, 0, len(tools))
+	refs := make(map[string]responsesToolRef)
 	var skipped []string
 	for i, t := range tools {
 		tool, ok := t.(map[string]any)
 		if !ok {
-			return nil, invalidResponses("tools", fmt.Sprintf("tools[%d] must be an object", i))
+			return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d] must be an object", i))
 		}
 		typ, _ := tool["type"].(string)
-		if typ != "function" {
-			// 客户端（如 Codex）会携带上游无法表达的内置工具：type:"namespace"
-			// （多智能体容器）、type:"web_search" 等。上游只支持 function 工具，
-			// 这类工具无法无损转发——跳过并告警，而不是让整个请求 400（否则 Codex 不可用）。
-			skipped = append(skipped, typ)
-			continue
-		}
-		var fn map[string]any
-		if inner, ok := tool["function"].(map[string]any); ok {
-			fn = inner
-		} else {
+		switch typ {
+		case "function":
+			fn, rerr := mapResponsesFunctionTool(tool, i)
+			if rerr != nil {
+				return nil, nil, rerr
+			}
+			out = append(out, map[string]any{"type": "function", "function": fn})
+		case "namespace":
+			ns, _ := tool["name"].(string)
+			subs, _ := tool["tools"].([]any)
+			if strings.TrimSpace(ns) == "" || len(subs) == 0 {
+				skipped = append(skipped, "namespace")
+				continue
+			}
+			nsDesc, _ := tool["description"].(string)
+			for j, st := range subs {
+				sub, ok := st.(map[string]any)
+				if !ok {
+					return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d].tools[%d] must be an object", i, j))
+				}
+				if styp, _ := sub["type"].(string); styp != "function" {
+					skipped = append(skipped, "namespace/"+styp)
+					continue
+				}
+				fn, rerr := mapResponsesFunctionTool(sub, i)
+				if rerr != nil {
+					return nil, nil, rerr
+				}
+				bare, _ := fn["name"].(string)
+				flat := flattenNamespaceTool(ns, bare)
+				fn["name"] = flat
+				// 命名空间描述并入子工具描述：上游只见扁平 function，命名空间语义
+				// 只能靠描述携带，否则模型不知道这批工具属于同一容器。
+				if nsDesc != "" {
+					if d, _ := fn["description"].(string); d != "" {
+						fn["description"] = nsDesc + "\n\n" + d
+					} else {
+						fn["description"] = nsDesc
+					}
+				}
+				out = append(out, map[string]any{"type": "function", "function": fn})
+				refs[flat] = responsesToolRef{namespace: ns, name: bare}
+			}
+		case "custom":
 			name, _ := tool["name"].(string)
 			if strings.TrimSpace(name) == "" {
-				return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: function name is required", i))
+				return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: custom tool name is required", i))
 			}
-			fn = map[string]any{"name": name}
+			// freeform（grammar）在上游无法表达，退化为单字符串参数 input：
+			// 模型把整段文本塞进该参数，渲染层再还原成 custom_tool_call.input。
+			fn := map[string]any{
+				"name": name,
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"input": map[string]any{
+							"type":        "string",
+							"description": "Raw tool input text. Pass the tool's freeform payload verbatim.",
+						},
+					},
+					"required": []any{"input"},
+				},
+			}
 			if desc, ok := tool["description"].(string); ok {
 				fn["description"] = desc
 			}
-			if params, ok := tool["parameters"]; ok && params != nil {
-				fn["parameters"] = params
-			}
-			if strict, ok := tool["strict"]; ok && strict != nil {
-				fn["strict"] = strict
-			}
+			out = append(out, map[string]any{"type": "function", "function": fn})
+			refs[name] = responsesToolRef{name: name, custom: true}
+		default:
+			// type:"web_search" 等上游无法表达的内置工具：搜索由服务端执行器完成，
+			// 网关无法替代。跳过并告警（不 400），否则 Codex 整体不可用。
+			skipped = append(skipped, typ)
 		}
-		if name, _ := fn["name"].(string); strings.TrimSpace(name) == "" {
-			return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: function name is required", i))
-		}
-		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	if len(skipped) > 0 {
-		log.Printf("WARN: [server] responses: skipped %d non-function tool(s) the upstream cannot express: %v", len(skipped), skipped)
+		log.Printf("WARN: [server] responses: skipped %d tool(s) the upstream cannot express: %v", len(skipped), skipped)
 	}
-	return out, nil
+	return out, refs, nil
+}
+
+// mapResponsesFunctionTool 归一化单个 Responses function 工具为上游嵌套 function 形态。
+// 同时接受已嵌套的 {type:"function",function:{...}}。
+func mapResponsesFunctionTool(tool map[string]any, i int) (map[string]any, *responsesError) {
+	if inner, ok := tool["function"].(map[string]any); ok {
+		if name, _ := inner["name"].(string); strings.TrimSpace(name) == "" {
+			return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: function name is required", i))
+		}
+		return inner, nil
+	}
+	name, _ := tool["name"].(string)
+	if strings.TrimSpace(name) == "" {
+		return nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: function name is required", i))
+	}
+	fn := map[string]any{"name": name}
+	if desc, ok := tool["description"].(string); ok {
+		fn["description"] = desc
+	}
+	if params, ok := tool["parameters"]; ok && params != nil {
+		fn["parameters"] = params
+	}
+	if strict, ok := tool["strict"]; ok && strict != nil {
+		fn["strict"] = strict
+	}
+	return fn, nil
+}
+
+// normalizeResponsesCustomToolCall 归一化 {type:"custom_tool_call",call_id,name,input}
+// → OpenAI assistant 消息（tool_calls 单元素，arguments 为 {"input":...}）。
+// 与 custom 工具声明时的单参数形态对齐，保证历史与本轮 tools 逐字一致。
+func normalizeResponsesCustomToolCall(obj map[string]any, i int) (any, *responsesError) {
+	callID, _ := obj["call_id"].(string)
+	name, _ := obj["name"].(string)
+	input, _ := obj["input"].(string)
+	if strings.TrimSpace(callID) == "" {
+		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: custom_tool_call.call_id is required", i))
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: custom_tool_call.name is required", i))
+	}
+	args, _ := json.Marshal(map[string]any{"input": input})
+	return map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{map[string]any{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": string(args),
+			},
+		}},
+	}, nil
+}
+
+// normalizeResponsesCustomToolCallOutput 归一化 {type:"custom_tool_call_output",call_id,output}
+// → OpenAI tool 消息（与 function_call_output 同形）。
+func normalizeResponsesCustomToolCallOutput(obj map[string]any, i int) (any, *responsesError) {
+	callID, _ := obj["call_id"].(string)
+	if strings.TrimSpace(callID) == "" {
+		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: custom_tool_call_output.call_id is required", i))
+	}
+	var content string
+	switch out := obj["output"].(type) {
+	case nil:
+		content = ""
+	case string:
+		content = out
+	default:
+		b, err := json.Marshal(out)
+		if err != nil {
+			return nil, invalidResponses("input",
+				fmt.Sprintf("input[%d]: custom_tool_call_output.output could not be encoded", i))
+		}
+		content = string(b)
+	}
+	return map[string]any{"role": "tool", "tool_call_id": callID, "content": content}, nil
 }
 
 // mapResponsesToolChoice 映射 tool_choice："auto"/"none"/"required" 原样；
