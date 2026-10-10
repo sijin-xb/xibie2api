@@ -78,9 +78,13 @@ type responsesToolCall struct {
 	itemID   string
 	callID   string
 	name     string
+	ref      responsesToolRef // 还原用：namespace / custom 形态（零值 = 普通 function）
 	args     strings.Builder
-	opened   bool
-	closed   bool
+	// customEmitted 记录 custom 工具已发出的 input 文本长度：上游 JSON 参数是增量
+	// 分片，解析出 input 字段后只发新增部分，避免重复。
+	customEmitted int
+	opened        bool
+	closed        bool
 }
 
 // responsesSink 是 FrameSink 的 Responses 实现：拥有事件状态机（sequence_number、
@@ -317,16 +321,51 @@ func (s *responsesSink) handleToolCall(tc map[string]any) error {
 	if fn, ok := tc["function"].(map[string]any); ok {
 		if name, ok := fn["name"].(string); ok && name != "" && st.name == "" {
 			st.name = name
+			st.ref = s.meta.toolRefs[name]
 		}
+	}
+	// custom 工具：上游按单参数 function 输出 JSON，这里立刻转成 freeform 文本增量。
+	if st.ref.custom {
+		if fn, ok := tc["function"].(map[string]any); ok {
+			if args, ok := fn["arguments"].(string); ok && args != "" {
+				st.args.WriteString(args)
+			}
+		}
+		if !st.opened {
+			st.opened = true
+			if err := s.emit("response.output_item.added", map[string]any{
+				"output_index": st.outIndex,
+				"item": map[string]any{
+					"type": "custom_tool_call", "id": st.itemID, "call_id": st.callID,
+					"name": st.name, "input": "", "status": "in_progress",
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		if delta := customInputDelta(&st.customEmitted, st.args.String()); delta != "" {
+			if err := s.emit("response.custom_tool_call_input.delta", map[string]any{
+				"item_id": st.itemID, "output_index": st.outIndex, "delta": delta,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if !st.opened {
 		st.opened = true
+		item := map[string]any{
+			"type": "function_call", "id": st.itemID, "call_id": st.callID,
+			"name": st.name, "arguments": "", "status": "in_progress",
+		}
+		// namespace 工具：上游只见过摊平名，回程还原为 Codex 的 namespace 形态。
+		if st.ref.namespace != "" {
+			item["namespace"] = st.ref.namespace
+			item["name"] = st.ref.name
+		}
 		if err := s.emit("response.output_item.added", map[string]any{
 			"output_index": st.outIndex,
-			"item": map[string]any{
-				"type": "function_call", "id": st.itemID, "call_id": st.callID,
-				"name": st.name, "arguments": "", "status": "in_progress",
-			},
+			"item":         item,
 		}); err != nil {
 			return err
 		}
@@ -392,10 +431,27 @@ func (s *responsesSink) Done() error {
 		if st == nil || st.closed {
 			continue
 		}
-		if err := s.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": st.itemID, "output_index": st.outIndex, "arguments": st.args.String(),
-		}); err != nil {
-			return err
+		if st.ref.custom {
+			input := customToolInput(st.args.String())
+			if delta := input[st.customEmitted:]; delta != "" {
+				if err := s.emit("response.custom_tool_call_input.delta", map[string]any{
+					"item_id": st.itemID, "output_index": st.outIndex, "delta": delta,
+				}); err != nil {
+					return err
+				}
+			}
+			st.customEmitted = len(input)
+			if err := s.emit("response.custom_tool_call_input.done", map[string]any{
+				"item_id": st.itemID, "output_index": st.outIndex, "input": input,
+			}); err != nil {
+				return err
+			}
+		} else {
+			if err := s.emit("response.function_call_arguments.done", map[string]any{
+				"item_id": st.itemID, "output_index": st.outIndex, "arguments": st.args.String(),
+			}); err != nil {
+				return err
+			}
 		}
 		if err := s.emit("response.output_item.done", map[string]any{
 			"output_index": st.outIndex,
@@ -453,10 +509,47 @@ func (s *responsesSink) completedMessageItem() map[string]any {
 }
 
 func (t *responsesToolCall) completedItem() map[string]any {
-	return map[string]any{
+	if t.ref.custom {
+		return map[string]any{
+			"type": "custom_tool_call", "id": t.itemID, "call_id": t.callID,
+			"name": t.ref.name, "input": customToolInput(t.args.String()), "status": "completed",
+		}
+	}
+	item := map[string]any{
 		"type": "function_call", "id": t.itemID, "call_id": t.callID,
 		"name": t.name, "arguments": t.args.String(), "status": "completed",
 	}
+	if t.ref.namespace != "" {
+		item["namespace"] = t.ref.namespace
+		item["name"] = t.ref.name
+	}
+	return item
+}
+
+// customToolInput 从上游单参数 function 的 JSON 参数里取出 input 字段文本。
+// 解析失败（分片未完整/上游未按约定输出）→ 返回原文，宁可原样透出也不丢内容。
+func customToolInput(rawArgs string) string {
+	if rawArgs == "" {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(rawArgs), &obj); err == nil {
+		if s, ok := obj["input"].(string); ok {
+			return s
+		}
+	}
+	return rawArgs
+}
+
+// customInputDelta 返回相比已发出长度新增的 input 文本（流式增量）。
+func customInputDelta(emitted *int, rawArgs string) string {
+	input := customToolInput(rawArgs)
+	if len(input) <= *emitted {
+		return ""
+	}
+	delta := input[*emitted:]
+	*emitted = len(input)
+	return delta
 }
 
 // finalOutput 按 output_index 升序汇总所有已完成 item。
@@ -551,6 +644,24 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		if fn, ok := tc["function"].(map[string]any); ok {
 			name, _ = fn["name"].(string)
 			args, _ = fn["arguments"].(string)
+		}
+		// 还原 namespace / custom 形态：上游只见过摊平后的扁平 function 名。
+		if ref, ok := meta.toolRefs[name]; ok {
+			if ref.custom {
+				output = append(output, map[string]any{
+					"type": "custom_tool_call", "id": "ctc_" + randHex(16), "call_id": callID,
+					"name": ref.name, "input": customToolInput(args), "status": "completed",
+				})
+				continue
+			}
+			if ref.namespace != "" {
+				output = append(output, map[string]any{
+					"type": "function_call", "id": "fc_" + randHex(16), "call_id": callID,
+					"namespace": ref.namespace, "name": ref.name, "arguments": args,
+					"status": "completed",
+				})
+				continue
+			}
 		}
 		output = append(output, map[string]any{
 			"type": "function_call", "id": "fc_" + randHex(16), "call_id": callID,
