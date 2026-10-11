@@ -17,6 +17,7 @@
 //   - max_tokens (必填, 正整数) → body["max_tokens"]
 //   - messages (必填数组)    → body["messages"]（见 normalizeMessagesArray）
 //   - system (string | text 块数组) → 前置一条 role:"system"
+//   - messages 内的 role:"system"（mid-conversation-system beta）→ 原地一条 role:"system"
 //   - stream (缺省 false)    → body["stream"]
 //   - temperature / top_p    → 同名转发
 //   - stop_sequences         → body["stop"]
@@ -280,8 +281,14 @@ func normalizeMessagesArray(messages []any) ([]any, *messagesError) {
 				return nil, merr
 			}
 			out = append(out, msg)
+		case "system":
+			msg, merr := normalizeSystemMessage(obj, i)
+			if merr != nil {
+				return nil, merr
+			}
+			out = append(out, msg)
 		default:
-			return nil, invalidMessages(fmt.Sprintf("messages[%d].role", i), `role must be "user" or "assistant"`)
+			return nil, invalidMessages(fmt.Sprintf("messages[%d].role", i), `role must be "user", "assistant", or "system"`)
 		}
 	}
 	return out, nil
@@ -389,6 +396,36 @@ func normalizeAssistantMessage(obj map[string]any, i int) (any, *messagesError) 
 			msg["tool_calls"] = toolCalls
 		}
 		return msg, nil
+	default:
+		return nil, invalidMessages(fmt.Sprintf("messages[%d].content", i), "content must be a string or an array")
+	}
+}
+
+// normalizeSystemMessage 归一化一条 messages 数组内的 role:"system" 消息
+// （Anthropic mid-conversation-system beta，Claude Code 用它插入会话中途的提醒）。
+// content 为 string 或 text 块数组，按序拼成单条 role:"system" OpenAI 消息，保持
+// 其在会话中的原位置——不折叠进顶层 system（语义不同：顶层是会话级规范，中途
+// system 是随轮次出现的提醒）。
+func normalizeSystemMessage(obj map[string]any, i int) (any, *messagesError) {
+	switch v := obj["content"].(type) {
+	case string:
+		return map[string]any{"role": "system", "content": v}, nil
+	case []any:
+		var sb strings.Builder
+		for j, b := range v {
+			block, ok := b.(map[string]any)
+			if !ok {
+				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d]", i, j), "content block must be an object")
+			}
+			typ, _ := block["type"].(string)
+			if typ != "text" {
+				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].type", i, j),
+					fmt.Sprintf("unsupported system content block type %q", typ))
+			}
+			txt, _ := block["text"].(string)
+			sb.WriteString(txt)
+		}
+		return map[string]any{"role": "system", "content": sb.String()}, nil
 	default:
 		return nil, invalidMessages(fmt.Sprintf("messages[%d].content", i), "content must be a string or an array")
 	}

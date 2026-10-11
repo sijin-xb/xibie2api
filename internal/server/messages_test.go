@@ -1,8 +1,8 @@
 // messages_test.go —— /v1/messages（Anthropic Messages API 子集）的行为测试。
 //
-// 覆盖：请求归一化（支持矩阵 + 拒绝项）、system 两种形态、tool_use/tool_result 多轮
-// 往返、非流式转换（文本/工具/stop_reason/usage）、流式事件生命周期、上游 error 帧、
-// 空流、sink 写失败、路由/鉴权/校验错误、模型别名、提示词模式。
+// 覆盖：请求归一化（支持矩阵 + 拒绝项）、system 两种形态 + messages 内 mid-conversation
+// system、tool_use/tool_result 多轮往返、非流式转换（文本/工具/stop_reason/usage）、流式
+// 事件生命周期、上游 error 帧、空流、sink 写失败、路由/鉴权/校验错误、模型别名、提示词模式。
 // 复用 handler_test.go / prompt_modes_test.go / chat_regression_test.go 的夹具
 // （newFakeUpstream、testPoolWith、sseOK、captureUpstream、outboundMessages、
 // staticRegressionUpstream、regNonStreamSSE、regFragmentedToolSSE、parseSSEEvents）。
@@ -257,6 +257,33 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("mid_conversation_system", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be terse"}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("mid-conversation system must be accepted: %+v", err)
+		}
+		s := string(body)
+		ui, si := strings.Index(s, `"role":"user"`), strings.Index(s, `"role":"system"`)
+		if ui < 0 || si < 0 || si < ui {
+			t.Fatalf("system message must keep its position: %s", s)
+		}
+		if !strings.Contains(s, `"content":"be terse"`) {
+			t.Fatalf("system content lost: %s", s)
+		}
+	})
+
+	t.Run("mid_conversation_system_text_blocks", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"system","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("system text blocks must be accepted: %+v", err)
+		}
+		if !strings.Contains(string(body), `"content":"ab"`) {
+			t.Fatalf("system blocks must be concatenated: %s", body)
+		}
+	})
+
 	rejectCases := []struct {
 		name  string
 		raw   string
@@ -273,7 +300,7 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		{"messages_wrong_type", `{"model":"m","max_tokens":10,"messages":"hi"}`, "messages"},
 		{"stream_wrong_type", `{"model":"m","max_tokens":10,"stream":"yes","messages":[]}`, "stream"},
 		{"unknown_content_block", `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"bogus"}]}]}`, "type"},
-		{"unknown_role", `{"model":"m","max_tokens":10,"messages":[{"role":"system","content":"x"}]}`, "role"},
+		{"unknown_role", `{"model":"m","max_tokens":10,"messages":[{"role":"tool","content":"x"}]}`, "role"},
 		{"unknown_tool_choice", `{"model":"m","max_tokens":10,"messages":[],"tool_choice":{"type":"weird"}}`, "tool_choice.type"},
 		{"top_k", `{"model":"m","max_tokens":10,"messages":[],"top_k":5}`, "top_k"},
 		{"thinking", `{"model":"m","max_tokens":10,"messages":[],"thinking":{"type":"enabled"}}`, "thinking"},
