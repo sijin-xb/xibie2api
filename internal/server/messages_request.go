@@ -6,10 +6,12 @@
 //   - 归一化只做「请求形态翻译」，**不**做别名 / 提示词 / 脱敏（那些在 prepareTurn 里
 //     对归一化后的 OpenAI body 执行）。归一化出的 body["model"] 必须是**原始客户端
 //     model 字符串**，这样 peek.Model / 别名 / 出站重写与 chat 路径逐字节一致。
-//   - 网关是无状态的：会改变生成语义、上游 OpenAI 形态又无法表达的字段一律 **400 拒绝**
-//     （top_k / container / mcp_servers / context_management / service_tier），绝不静默丢弃。
-//     例外：**output_config / thinking 做映射而非拒绝**——Claude Code 的侧查询会无条件
-//     带上 output_config，400 会让 auto 模式分类器等整类功能失效（详见下方注释）。
+//   - 网关是 Claude Code 的兼容前端：Anthropic 专有、上游 OpenAI 形态无法表达的字段
+//     （top_k / container / mcp_servers / context_management / service_tier）**接受但忽略**，
+//     不再 400。理由：Claude Code 会随 beta 演进**无条件**带上这些字段（例如开启
+//     effort / thinking 后就会带 context_management），逐个 400 会让整类功能失效
+//     （auto 模式无法判断 Bash 安全性、Bash/Edit 全被拦），且疲于奔命。
+//     可表达的字段一律映射（见 output_config / thinking），不可表达的忽略。
 //   - metadata（含 metadata.user_id）**接受但不转发**（语义惰性，仅回显需要才留存；
 //     本网关不回显，故直接忽略）。
 //
@@ -58,17 +60,6 @@ func invalidMessages(field, message string) *messagesError {
 		message = field + ": " + message
 	}
 	return &messagesError{status: http.StatusBadRequest, typ: "invalid_request_error", message: message}
-}
-
-// unsupportedMessages 构造「字段被明确拒绝」的错误：命名该字段并说明原因。
-// 拒绝而非静默丢弃的理由：这些字段会改变生成语义，而网关无状态、上游 OpenAI
-// 形态无法表达——静默丢弃会让客户端以为设置生效（如 top_k 截断、thinking 预算）。
-func unsupportedMessages(field string) *messagesError {
-	return &messagesError{
-		status:  http.StatusBadRequest,
-		typ:     "invalid_request_error",
-		message: field + " is not supported by this gateway: it changes generation semantics and cannot be represented by the upstream; remove the field and retry",
-	}
 }
 
 // messages 是 /v1/messages 入口：读体 → 归一化为 OpenAI body → 共享准备层 →
@@ -235,15 +226,8 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 		}
 	}
 
-	// 仍然拒绝：这些字段改变生成语义、上游形态又无法表达，静默丢弃会让客户端误以为
-	// 设置生效（如 top_k 截断）。output_config / thinking 已在上方映射，不再走此分支。
-	for _, field := range []string{
-		"top_k", "container", "mcp_servers", "context_management", "service_tier",
-	} {
-		if v, ok := root[field]; ok && v != nil {
-			return nil, messagesMeta{}, unsupportedMessages(field)
-		}
-	}
+	// top_k / container / mcp_servers / context_management / service_tier：Anthropic 专有、
+	// 上游无法表达，**接受但忽略**（不 400）。见文件头「设计纪律」。
 	// metadata（含 metadata.user_id）：接受但忽略（不转发、不回显）。
 
 	// messages 归一化（tool_use/tool_result/文本/图片块）。

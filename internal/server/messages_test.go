@@ -369,6 +369,20 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("anthropic_only_fields_ignored", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"top_k":5,"container":"c","mcp_servers":[],"context_management":{},"service_tier":"auto"}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("Anthropic-only fields must be accepted+ignored, not rejected: %+v", err)
+		}
+		s := string(body)
+		for _, f := range []string{"top_k", "container", "mcp_servers", "context_management", "service_tier"} {
+			if strings.Contains(s, f) {
+				t.Fatalf("%s must not leak into the outbound body: %s", f, s)
+			}
+		}
+	})
+
 	rejectCases := []struct {
 		name  string
 		raw   string
@@ -387,11 +401,6 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		{"unknown_content_block", `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"bogus"}]}]}`, "type"},
 		{"unknown_role", `{"model":"m","max_tokens":10,"messages":[{"role":"tool","content":"x"}]}`, "role"},
 		{"unknown_tool_choice", `{"model":"m","max_tokens":10,"messages":[],"tool_choice":{"type":"weird"}}`, "tool_choice.type"},
-		{"top_k", `{"model":"m","max_tokens":10,"messages":[],"top_k":5}`, "top_k"},
-		{"container", `{"model":"m","max_tokens":10,"messages":[],"container":"c"}`, "container"},
-		{"mcp_servers", `{"model":"m","max_tokens":10,"messages":[],"mcp_servers":[]}`, "mcp_servers"},
-		{"context_management", `{"model":"m","max_tokens":10,"messages":[],"context_management":{}}`, "context_management"},
-		{"service_tier", `{"model":"m","max_tokens":10,"messages":[],"service_tier":"auto"}`, "service_tier"},
 	}
 	for _, tc := range rejectCases {
 		t.Run("reject_"+tc.name, func(t *testing.T) {
