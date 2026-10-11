@@ -165,6 +165,46 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("tool_result_with_image", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"shot"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("tool_result with image must be accepted: %+v", err)
+		}
+		m := mustDecodeJSON(t, body)["messages"].([]any)[0].(map[string]any)
+		if m["role"] != "tool" || m["tool_call_id"] != "t1" {
+			t.Fatalf("message=%v", m)
+		}
+		parts, ok := m["content"].([]any)
+		if !ok {
+			t.Fatalf("image-bearing tool_result must keep a parts array: %v", m["content"])
+		}
+		p1 := parts[1].(map[string]any)
+		if p1["type"] != "image_url" || p1["image_url"].(map[string]any)["url"] != "data:image/png;base64,AAAA" {
+			t.Fatalf("image part=%v", p1)
+		}
+	})
+
+	t.Run("tool_result_text_only_is_string", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("text-only tool_result must be accepted: %+v", err)
+		}
+		m := mustDecodeJSON(t, body)["messages"].([]any)[0].(map[string]any)
+		if m["content"] != "ab" {
+			t.Fatalf("text-only tool_result must stay a joined string: %v", m["content"])
+		}
+	})
+
+	t.Run("tool_result_bad_block_type", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"bogus"}]}]}]}`
+		_, _, err := normalizeMessagesRequest([]byte(raw))
+		if err == nil || !strings.Contains(err.message, "unsupported tool_result content block type") {
+			t.Fatalf("want unsupported-block error, got %+v", err)
+		}
+	})
+
 	t.Run("image_base64", func(t *testing.T) {
 		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 		body, _, err := normalizeMessagesRequest([]byte(raw))
