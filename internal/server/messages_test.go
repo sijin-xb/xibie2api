@@ -324,6 +324,51 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("output_config_effort_mapped", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}}}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("output_config must be accepted (Claude Code side queries always send it): %+v", err)
+		}
+		m := mustDecodeJSON(t, body)
+		if m["reasoning_effort"] != "high" {
+			t.Fatalf("effort must map to reasoning_effort: %s", body)
+		}
+		if _, ok := m["output_config"]; ok {
+			t.Fatalf("output_config must not be forwarded verbatim: %s", body)
+		}
+		if _, ok := m["format"]; ok {
+			t.Fatalf("output_config.format must not leak into the outbound body: %s", body)
+		}
+	})
+
+	t.Run("output_config_without_effort_ignored", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[],"output_config":{"format":{"type":"json_schema"}}}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("output_config.format must be ignored, not rejected: %+v", err)
+		}
+		if _, ok := mustDecodeJSON(t, body)["reasoning_effort"]; ok {
+			t.Fatalf("no effort → no reasoning_effort: %s", body)
+		}
+	})
+
+	t.Run("thinking_mapped", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[],"thinking":{"type":"disabled","budget_tokens":4096}}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("thinking must be accepted: %+v", err)
+		}
+		m := mustDecodeJSON(t, body)
+		th, ok := m["thinking"].(map[string]any)
+		if !ok || th["type"] != "disabled" {
+			t.Fatalf("thinking.type must map through: %s", body)
+		}
+		if _, ok := th["budget_tokens"]; ok {
+			t.Fatalf("budget_tokens must be dropped: %s", body)
+		}
+	})
+
 	rejectCases := []struct {
 		name  string
 		raw   string
@@ -343,8 +388,6 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		{"unknown_role", `{"model":"m","max_tokens":10,"messages":[{"role":"tool","content":"x"}]}`, "role"},
 		{"unknown_tool_choice", `{"model":"m","max_tokens":10,"messages":[],"tool_choice":{"type":"weird"}}`, "tool_choice.type"},
 		{"top_k", `{"model":"m","max_tokens":10,"messages":[],"top_k":5}`, "top_k"},
-		{"thinking", `{"model":"m","max_tokens":10,"messages":[],"thinking":{"type":"enabled"}}`, "thinking"},
-		{"output_config", `{"model":"m","max_tokens":10,"messages":[],"output_config":{}}`, "output_config"},
 		{"container", `{"model":"m","max_tokens":10,"messages":[],"container":"c"}`, "container"},
 		{"mcp_servers", `{"model":"m","max_tokens":10,"messages":[],"mcp_servers":[]}`, "mcp_servers"},
 		{"context_management", `{"model":"m","max_tokens":10,"messages":[],"context_management":{}}`, "context_management"},

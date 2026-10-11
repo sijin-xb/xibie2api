@@ -6,9 +6,10 @@
 //   - 归一化只做「请求形态翻译」，**不**做别名 / 提示词 / 脱敏（那些在 prepareTurn 里
 //     对归一化后的 OpenAI body 执行）。归一化出的 body["model"] 必须是**原始客户端
 //     model 字符串**，这样 peek.Model / 别名 / 出站重写与 chat 路径逐字节一致。
-//   - 网关是无状态的：任何会改变生成语义、而上游 OpenAI 形态又无法表达的字段一律
-//     **400 拒绝**（top_k / thinking / output_config / container / mcp_servers /
-//     context_management / service_tier），绝不静默丢弃。
+//   - 网关是无状态的：会改变生成语义、上游 OpenAI 形态又无法表达的字段一律 **400 拒绝**
+//     （top_k / container / mcp_servers / context_management / service_tier），绝不静默丢弃。
+//     例外：**output_config / thinking 做映射而非拒绝**——Claude Code 的侧查询会无条件
+//     带上 output_config，400 会让 auto 模式分类器等整类功能失效（详见下方注释）。
 //   - metadata（含 metadata.user_id）**接受但不转发**（语义惰性，仅回显需要才留存；
 //     本网关不回显，故直接忽略）。
 //
@@ -23,6 +24,8 @@
 //   - stop_sequences         → body["stop"]
 //   - tools ({name,description,input_schema}) → {type:"function",function:{...}}
 //   - tool_choice ({type:auto|any|none|tool}) → "auto"|"required"|"none"|{function}
+//   - output_config.effort  → body["reasoning_effort"]（format 等其余键忽略）
+//   - thinking.type (enabled|disabled) → body["thinking"]["type"]（budget_tokens 忽略）
 package server
 
 import (
@@ -197,10 +200,45 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 		toolChoice = v
 	}
 
-	// 明确拒绝项（改变生成语义 / 网关无法表达）：命名字段并 400，绝不静默丢弃。
+	// output_config / thinking：Anthropic 的生成控制字段。网关是 Claude Code 的兼容
+	// 前端，而 Claude Code 的侧查询（会话命名、auto 模式安全性分类等）会**无条件**带上
+	// output_config；直接 400 会让整类功能失效（auto 模式无法判断 Bash 安全性 → 命令被拦）。
+	// 因此做映射而非拒绝：
+	//   - output_config.effort → 出站 reasoning_effort（沿用网关既有档位降级管线）
+	//   - output_config.format（结构化输出 JSON Schema）→ 上游无对应能力，忽略
+	//   - thinking.type → 出站 thinking.type（enabled / disabled）；budget_tokens 忽略
+	//     （档位由 reasoning_effort 表达，缺省时网关 thinking.go 会补模型默认档）
+	var reasoningEffort any
+	if v, ok := root["output_config"]; ok && v != nil {
+		oc, ok := v.(map[string]any)
+		if !ok {
+			return nil, messagesMeta{}, invalidMessages("output_config", "output_config must be an object")
+		}
+		if eff, ok := oc["effort"]; ok && eff != nil {
+			s, ok := eff.(string)
+			if !ok {
+				return nil, messagesMeta{}, invalidMessages("output_config.effort", "output_config.effort must be a string")
+			}
+			if strings.TrimSpace(s) != "" {
+				reasoningEffort = s
+			}
+		}
+	}
+	var outThinking any
+	if v, ok := root["thinking"]; ok && v != nil {
+		th, ok := v.(map[string]any)
+		if !ok {
+			return nil, messagesMeta{}, invalidMessages("thinking", "thinking must be an object")
+		}
+		if t, _ := th["type"].(string); t == "enabled" || t == "disabled" {
+			outThinking = map[string]any{"type": t}
+		}
+	}
+
+	// 仍然拒绝：这些字段改变生成语义、上游形态又无法表达，静默丢弃会让客户端误以为
+	// 设置生效（如 top_k 截断）。output_config / thinking 已在上方映射，不再走此分支。
 	for _, field := range []string{
-		"top_k", "thinking", "output_config", "container",
-		"mcp_servers", "context_management", "service_tier",
+		"top_k", "container", "mcp_servers", "context_management", "service_tier",
 	} {
 		if v, ok := root[field]; ok && v != nil {
 			return nil, messagesMeta{}, unsupportedMessages(field)
@@ -248,6 +286,12 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 			return nil, messagesMeta{}, merr
 		}
 		body["tool_choice"] = mapped
+	}
+	if reasoningEffort != nil {
+		body["reasoning_effort"] = reasoningEffort
+	}
+	if outThinking != nil {
+		body["thinking"] = outThinking
 	}
 
 	out, jerr := json.Marshal(body)
