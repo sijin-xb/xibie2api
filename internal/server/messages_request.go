@@ -432,11 +432,18 @@ func normalizeSystemMessage(obj map[string]any, i int) (any, *messagesError) {
 }
 
 // mapAnthropicImage 把 {type:"image",source:{...}} 映射为 OpenAI image_url part。
-// base64 源拼 data URI；url 源直接透传；其余 source.type 一律拒绝。
+// 仅用于 user 消息（错误路径前缀按 messages[i].content[j] 生成）。
 func mapAnthropicImage(block map[string]any, i, j int) (map[string]any, *messagesError) {
+	return mapAnthropicImageAt(block, fmt.Sprintf("messages[%d].content[%d]", i, j))
+}
+
+// mapAnthropicImageAt 是 mapAnthropicImage 的实现，path 为错误消息里的字段前缀
+// （user 消息用 messages[i].content[j]，tool_result 内嵌图片用更长的路径）。
+// base64 源拼 data URI；url 源直接透传；其余 source.type 一律拒绝。
+func mapAnthropicImageAt(block map[string]any, path string) (map[string]any, *messagesError) {
 	src, ok := block["source"].(map[string]any)
 	if !ok {
-		return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].source", i, j), "image.source must be an object")
+		return nil, invalidMessages(path+".source", "image.source must be an object")
 	}
 	stype, _ := src["type"].(string)
 	switch stype {
@@ -444,7 +451,7 @@ func mapAnthropicImage(block map[string]any, i, j int) (map[string]any, *message
 		mediaType, _ := src["media_type"].(string)
 		data, _ := src["data"].(string)
 		if strings.TrimSpace(mediaType) == "" || strings.TrimSpace(data) == "" {
-			return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].source", i, j),
+			return nil, invalidMessages(path+".source",
 				"image.source.media_type and image.source.data are required for base64 source")
 		}
 		return map[string]any{
@@ -454,50 +461,65 @@ func mapAnthropicImage(block map[string]any, i, j int) (map[string]any, *message
 	case "url":
 		url, _ := src["url"].(string)
 		if strings.TrimSpace(url) == "" {
-			return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].source", i, j),
+			return nil, invalidMessages(path+".source",
 				"image.source.url is required for url source")
 		}
 		return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}, nil
 	default:
-		return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].source.type", i, j),
+		return nil, invalidMessages(path+".source.type",
 			fmt.Sprintf("unsupported image source type %q", stype))
 	}
 }
 
 // mapAnthropicToolResult 把 {type:"tool_result",tool_use_id,content,is_error} 映射为
-// OpenAI role:"tool" 消息。content 为数组时仅支持 text 块（拼接）；is_error 不映射
-// （OpenAI 无对应字段，语义由文本表达——不伪造）。
+// OpenAI role:"tool" 消息。content 为数组时支持 text 与 image 块：只含文本 → 拼成
+// 字符串（与既有形态一致，兼容性最好）；含图片 → 输出多模态 parts 数组（OpenAI 的
+// tool 消息 content 允许是 part 数组，Claude Code 的 Read 工具会返回图片）。
+// is_error 不映射（OpenAI 无对应字段，语义由文本表达——不伪造）。
 func mapAnthropicToolResult(block map[string]any, i, j int) (map[string]any, *messagesError) {
 	id, _ := block["tool_use_id"].(string)
 	if strings.TrimSpace(id) == "" {
 		return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].tool_use_id", i, j), "tool_result.tool_use_id is required")
 	}
-	var content string
+	base := fmt.Sprintf("messages[%d].content[%d]", i, j)
 	switch c := block["content"].(type) {
 	case nil:
-		content = ""
+		return map[string]any{"role": "tool", "tool_call_id": id, "content": ""}, nil
 	case string:
-		content = c
+		return map[string]any{"role": "tool", "tool_call_id": id, "content": c}, nil
 	case []any:
 		var sb strings.Builder
+		parts := make([]any, 0, len(c))
+		hasImage := false
 		for k, p := range c {
 			pm, ok := p.(map[string]any)
 			if !ok {
-				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].content[%d]", i, j, k), "tool_result content block must be an object")
+				return nil, invalidMessages(fmt.Sprintf("%s.content[%d]", base, k), "tool_result content block must be an object")
 			}
-			pt, _ := pm["type"].(string)
-			if pt != "text" {
-				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].content[%d].type", i, j, k),
+			switch pt, _ := pm["type"].(string); pt {
+			case "text":
+				txt, _ := pm["text"].(string)
+				sb.WriteString(txt)
+				parts = append(parts, map[string]any{"type": "text", "text": txt})
+			case "image":
+				part, merr := mapAnthropicImageAt(pm, fmt.Sprintf("%s.content[%d]", base, k))
+				if merr != nil {
+					return nil, merr
+				}
+				hasImage = true
+				parts = append(parts, part)
+			default:
+				return nil, invalidMessages(fmt.Sprintf("%s.content[%d].type", base, k),
 					fmt.Sprintf("unsupported tool_result content block type %q", pt))
 			}
-			txt, _ := pm["text"].(string)
-			sb.WriteString(txt)
 		}
-		content = sb.String()
+		if hasImage {
+			return map[string]any{"role": "tool", "tool_call_id": id, "content": parts}, nil
+		}
+		return map[string]any{"role": "tool", "tool_call_id": id, "content": sb.String()}, nil
 	default:
-		return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].content", i, j), "tool_result.content must be a string or an array")
+		return nil, invalidMessages(base+".content", "tool_result.content must be a string or an array")
 	}
-	return map[string]any{"role": "tool", "tool_call_id": id, "content": content}, nil
 }
 
 // mapAnthropicToolUse 把 {type:"tool_use",id,name,input} 映射为 OpenAI tool_call。
