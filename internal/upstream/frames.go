@@ -67,11 +67,25 @@ func pumpFrames(r io.Reader, sink FrameSink, o streamOptions) error {
 	maxToolIdx := -1
 	toolFinishSent := false
 
+	// 复读检测（见 loopguard.go）：**每条流一个实例**，只在配置开启时创建。
+	// 未开启时为 nil，Observe 是 nil 安全的方法（不会进入任何判定分支）。
+	var guard *LoopGuard
+	if o.loopGuard {
+		guard = &LoopGuard{}
+	}
+
 	// writeChunk 把一个 chunk 对象按规范白名单重建后交付给 sink，同时维护三件跨帧
 	// 状态：tool_calls name 收敛（每 index 仅首片带 name）、消息 id 续传、以及上游
 	// 已用过的最大 tool_call index（供标记修复接续编号）。
 	// fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 	writeChunk := func(obj map[string]any, fallback string) error {
+		// 复读检测先于写出：命中即中止本流，不让后续重复内容继续流向客户端、
+		// 也不让上游继续被读到（越早停越省钱）。
+		if guard != nil {
+			if txt := frameVisibleText(obj); txt != "" && guard.Observe(txt) {
+				return ErrLoopDetected
+			}
+		}
 		// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
 		stripToolCallNames(obj, toolCallSeen)
 		// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，

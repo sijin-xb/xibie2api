@@ -502,6 +502,15 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	// loopGuard 开启复读检测（见 loopguard.go）。开关而非实例：检测器必须**每条流
+	// 一个**，由 pumpFrames 内部创建，避免上一条流的累计文本污染下一条的判定。
+	loopGuard bool
+}
+
+// WithLoopGuard 开启「输出复读」检测：流尾窗口若完全周期性，即中止该次上游读取
+// 并返回 ErrLoopDetected。默认不开（零行为变化），由调用方按配置决定。
+func WithLoopGuard() StreamOption {
+	return func(o *streamOptions) { o.loopGuard = true }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。

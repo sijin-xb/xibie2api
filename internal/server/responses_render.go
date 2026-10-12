@@ -58,9 +58,7 @@ func (r responsesRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 	defer k.Close()
 	var fl http.Flusher = k
 	sink := newResponsesSink(k, fl, r.meta)
-	return upstream.PumpFrames(stats, sink,
-		upstream.WithMarkupRepair(repair),
-		upstream.WithErrorFrameObserver(onErrorFrame))
+	return upstream.PumpFrames(stats, sink, streamOpts(repair, onErrorFrame)...)
 }
 
 // renderNonStream 把聚合后的 OpenAI chat.completion 转换为 Responses 对象写出。

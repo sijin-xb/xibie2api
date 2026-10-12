@@ -159,7 +159,13 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// LoopGuard 输出复读检测开关。用指针表达"缺省 true"（与 api_keys[].enabled 同法），
+		// 因此老配置无需改动即默认开启；显式 false 可关闭。见 internal/upstream/loopguard.go。
+		LoopGuard *bool `json:"loop_guard,omitempty"`
 	} `json:"features"`
+
+	// LoopGuardOn 解析后的复读检测开关（缺省 true）。
+	LoopGuardOn bool `json:"-"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -656,6 +662,8 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.KeyTable = kt
+	// 输出复读检测：指针为 nil = 未配置 = 缺省开启；显式 false 关闭。
+	c.LoopGuardOn = c.Features.LoopGuard == nil || *c.Features.LoopGuard
 	// 可用性阈值告警：解析时长、校验 webhook 地址，编译成监控器直接吃的 Config。
 	if err := c.normalizeAlerting(); err != nil {
 		return err

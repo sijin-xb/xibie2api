@@ -5,7 +5,30 @@ import (
 	"time"
 )
 
-// TestMetricsConfig 覆盖 metrics 段：缺省关闭。
+// TestLoopGuardConfig 覆盖 features.loop_guard：缺省开启（指针为 nil），显式 false 关闭。
+func TestLoopGuardConfig(t *testing.T) {
+	c, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("parse default: %v", err)
+	}
+	if !c.LoopGuardOn {
+		t.Fatal("缺省应开启输出复读检测")
+	}
+	c, err = ParseConfig([]byte(`{"features":{"loop_guard":false}}`))
+	if err != nil {
+		t.Fatalf("parse false: %v", err)
+	}
+	if c.LoopGuardOn {
+		t.Fatal("显式 false 应关闭")
+	}
+	c, err = ParseConfig([]byte(`{"features":{"loop_guard":true,"sanitize_blacklist_fingerprints":true}}`))
+	if err != nil {
+		t.Fatalf("parse true: %v", err)
+	}
+	if !c.LoopGuardOn {
+		t.Fatal("显式 true 应开启")
+	}
+}
 func TestMetricsConfig(t *testing.T) {
 	c, err := ParseConfig([]byte(`{}`))
 	if err != nil {

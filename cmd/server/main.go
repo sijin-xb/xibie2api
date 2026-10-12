@@ -307,6 +307,9 @@ func main() {
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	// 输出复读检测开关（features.loop_guard，缺省开）。进程级配置，启动时注入一次，
+	// 面板保存配置时热更新。
+	server.SetLoopGuardEnabled(cfg.LoopGuardOn)
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -525,6 +528,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		Alert:                newCfg.AlertConfig,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	server.SetLoopGuardEnabled(newCfg.LoopGuardOn) // 复读检测热生效（下一次请求即用新值）
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

@@ -342,6 +342,15 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), p.bareModel, kind, logfmt.Truncate(errFrame, 200))
+			case errors.Is(sErr, upstream.ErrLoopDetected):
+				// 输出复读（模型退化）：**不罚号、不轮转**。复读是模型行为而非账号故障，
+				// 同一 body 换个号大概率复现同样的退化，轮转只会把烧钱乘以号数；也不再
+				// 记成功（这一跳没有产出可用结果）。检测点已经中止了上游读取，越早停越省钱。
+				// 与 11101/11115/图片无效同一哲学：请求内容或模型侧问题，不牵连账号健康。
+				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
+				log.Printf("WARN: [server] stream acct=%s model=%s: output loop detected, aborted (account not penalized)",
+					logfmt.Label(acct.UID, acct.Nickname), p.bareModel)
 			case errors.Is(sErr, upstream.ErrSinkWrite):
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
