@@ -167,6 +167,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **多 API Key（`api_keys`）** | 每把钥匙各自限定可调用的模型（`*`/`?` 通配）与出口域（`cn`/`global`），越权请求在网关本地 400 挡掉、不消耗额度；匹配常量时间、支持热生效。附逐 Key 用量台账（`data/key-usage.json`，只存指纹与备注名，不存密钥原文）+ 面板「用量 → API Key 用量」视图。未配置时行为与引入前逐字节一致 |
+| **可观测与告警（`metrics` / `alerting`）** | `GET /metrics` 暴露 Prometheus 文本格式指标（手写实现，零新依赖；默认关闭，关闭时 404，鉴权与 `/status` 同口径）。`alerting` 在健康账号数跌破阈值时向 webhook 推告警、恢复后推恢复通知，带 HMAC-SHA256 签名与 `X-Timestamp`；持续故障按冷却重复提醒，推送失败不切状态、下轮重试。全部热生效 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
 
@@ -417,6 +418,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
 | `model_aliases` | `[]` | **模型别名映射**（#5）：数组，元素 `{"from":"外部模型名","to":"网关目标模型名"}`。精确匹配；命中后把请求模型名替换为 `to`（可带 `cn:`/`global:` 前缀或裸名），再走既有 realm 解析与选号/策略管线。空/缺省 = 无别名（行为不变）。`from` 不得含 `:`；重复 `from`、`from` 含 `:`/空白/`*`、`to` 为空或含空白/`*`、链式别名均在启动/保存时**报错**（fail fast） |
 | `api_keys` | `[]` | **多 API Key**：数组，元素 `{"key":"...","name":"...","models":["glm-*"],"realm":"global","enabled":true}`。每把钥匙各自限定可调用的模型（支持 `*`/`?` 通配）与出口域。空/缺省 = 不启用，鉴权完全回落顶层 `api_key`（行为逐字节不变）。配了之后顶层 `api_key` **不再放行 `/v1/*`**（退居面板后备密钥）。详见[多 API Key](#多-api-keyapi_keys) |
+| `metrics.enabled` | `false` | 是否暴露 `GET /metrics`（Prometheus 文本格式）。关闭时该路径返回 404。热生效。详见[可观测与告警](#可观测与告警metrics--alerting) |
+| `alerting.*` | 见下 | 账号池可用性阈值告警：`enabled` / `webhook_url` / `secret` / `min_healthy`（缺省 1）/ `cooldown`（缺省 30m）/ `interval`（缺省 1m）。缺省全关。全部热生效。详见[可观测与告警](#可观测与告警metrics--alerting) |
 
 ### 模型别名映射（`model_aliases`）
 
@@ -477,6 +480,67 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 按钥匙归集请求数 / 失败数 / prompt / completion / 合计 token / 积分 / 活跃天 / 最近使用，可切窗口。
 - **配置里配了但一次没用过的钥匙也占一行**，否则"某把钥匙是不是没人用"无法回答。
 - 只有来自显式配置条目的请求才落台账行（顶层单 key 与不鉴权模式不产生行）。
+
+### 可观测与告警（`metrics` / `alerting`）
+
+**`GET /metrics`** — Prometheus 文本格式（exposition format 0.0.4）。手写实现，**不引入 `prometheus/client_golang`**：本仓库的依赖纪律是「能不加就不加」（前端 go:embed 单文件、零外部构建依赖），指标只有十几个 gauge/counter，文本格式真正要遵守的规范面（名字字符集、标签转义、HELP/TYPE 行）小到可以手工正确实现并用测试锁住。
+
+默认关闭：`metrics.enabled=false` 时该路径返回 **404**（不是 501），对端口扫描器表现为不存在。鉴权与 `/status` 同口径（Bearer）——指标含账号数与逐账号积分，不该匿名可读；Prometheus 侧用 `scrape_configs[].authorization.credentials` 传密钥。
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `workbuddy_build_info{version}` | gauge | 恒 1，用于版本对齐 |
+| `workbuddy_uptime_seconds` | gauge | 进程运行时长 |
+| `workbuddy_accounts{state}` | gauge | 池规模：`total` / `healthy` / `cooling` / `disabled` / `in_flight_full` |
+| `workbuddy_realm_servable{realm}` | gauge | 0/1，与 `/healthz` 的 `realm_servable` 同口径 |
+| `workbuddy_account_credits{uid,realm}` | gauge | 逐账号剩余积分 |
+| `workbuddy_account_healthy{uid}` | gauge | 0/1（未禁用且未冷却，与 `/status` 同口径） |
+| `workbuddy_requests_in_flight` | gauge | 在途请求数 |
+| `workbuddy_requests_total{outcome}` | counter | 已完成请求：`succeeded` / `failed` |
+| `workbuddy_request_duration_seconds_avg` | gauge | 平均端到端耗时 |
+| `workbuddy_usage_tokens_total{kind}` | counter | `prompt` / `completion` / `total` |
+| `workbuddy_usage_credits_total` | counter | 上游 `usage.credit` 累计扣除 |
+| `workbuddy_cache_tokens_total{result}` | counter | 前缀缓存 `hit` / `miss` |
+
+指标口径刻意与既有观测**同源**（`pool.CountsDetailed` / `ServableForRealm` / `reqlog.Snapshot` / `usage.Totals`），不在渲染层另算一套——否则 `/status`、面板、`/metrics` 三处数字迟早对不上，而「哪个数字是真的」是最难查的一类问题。
+
+**可用性阈值告警（`alerting`）** — 最典型的故障形态是「账号全被冷却/禁用，但进程还活着」：`/healthz` 返 503、`/v1/*` 返 `no_healthy_account`，可若没有外部告警，你只有在客户端报错时才会发现。
+
+```json
+"alerting": {
+  "enabled": true,
+  "webhook_url": "https://hooks.example.com/workbuddy",
+  "secret": "shared-secret",
+  "min_healthy": 1,
+  "cooldown": "30m",
+  "interval": "1m"
+}
+```
+
+- 健康账号数 `< min_healthy` → 推 `alert`；回到阈值以上 → 推 `recovery`。
+- **持续故障按 `cooldown` 重复提醒**——长时间故障只提醒一次等于没提醒，值班的人换班后就再也收不到信号了。
+- **推送失败不切换状态**：保持原状态、下一轮立即重试。告警被静默吞掉，是告警系统最不能接受的失败方式。
+- 关闭或 `webhook_url` 为空时状态机复位：重新启用会重新告警一次，而不是沿用旧状态导致恢复通知永不发出。
+- `min_healthy` 缺省 1（写 0 视为未填写——否则条件 `healthy < 0` 恒假，等于静默失效）。校验 fail fast：启用但 `webhook_url` 为空、URL 非 http/https、时长非法或非正数，启动/面板保存即报错。
+- 全部字段热生效（监控器每轮重新读取 livecfg 快照，无需重启）。
+
+请求体：
+
+```json
+{"event":"alert","service":"workbuddy2api","version":"1.13.0","healthy":0,"total":3,
+ "threshold":1,"timestamp":1753600000,"at":"2026-10-12T20:00:00+08:00"}
+```
+
+请求头：`Content-Type: application/json`、`X-Timestamp: <unix 秒>`（与请求体 `timestamp` 同值）、`secret` 非空时 `X-Signature: sha256=<hex>`。
+
+接收方校验（Python 示例）：
+
+```python
+import hmac, hashlib
+mac = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest("sha256=" + mac, request.headers["X-Signature"])
+# 再校验 X-Timestamp 与 body["timestamp"] 一致且时间新鲜，防旧报文重放
+```
 
 ### 上游超时语义（三段各归其位）
 
@@ -776,6 +840,7 @@ http://127.0.0.1:7863/panel/
 | `POST /v1/messages` | Bearer（`api_key` 非空时） | Anthropic Messages API 子集（Claude 客户端直连）；流式/非流式；复用同一条执行管线。支持矩阵见「Anthropic Messages 兼容」 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 10min；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
+| `GET /metrics` | Bearer（同上） | Prometheus 文本格式指标（`metrics.enabled=true` 时；否则 404）。见「可观测与告警」 |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。

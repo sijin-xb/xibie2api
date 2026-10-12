@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/metrics"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -74,6 +75,9 @@ type Config struct {
 	// KeyTable 多 API Key 匹配表（config api_keys 编译产物）。nil = 未配置，
 	// 鉴权回落 APIKey 单密钥语义——老配置零变化。Live 同时给出时 Live 优先。
 	KeyTable *apikey.Table
+
+	// Version 版本号，仅用于 /metrics 的 build_info 标签。
+	Version string
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
@@ -158,6 +162,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAuthMessages(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -255,6 +260,71 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"service":        ServiceName,
 		"realm_servable": realmServable,
 	})
+}
+
+// metricsHandler 暴露 Prometheus 文本格式指标（exposition format 0.0.4）。
+//
+// 鉴权与 /status 同口径（Bearer，经 withAuth）：指标含账号总数与逐账号积分，不该
+// 匿名可读；Prometheus 侧用 scrape_config 的 authorization.credentials 传密钥即可。
+//
+// 端点**常驻注册但默认关闭**：metrics.enabled=false 时返回 404（而不是 501），让它
+// 对端口扫描器表现得像一个不存在的路径。开关走 livecfg 快照，因此面板改配置即刻
+// 生效，无需重启。
+//
+// 指标口径刻意与既有观测同源（pool.CountsDetailed / ServableForRealm / reqlog
+// Snapshot / usage Totals），不在本函数里另算一套——否则 /status、面板、/metrics
+// 三处数字迟早对不上，而"哪个数字是真的"是最难查的一类问题。
+func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	if !h.loadLive().MetricsEnabled {
+		http.NotFound(w, r)
+		return
+	}
+
+	snap := metrics.Snapshot{Version: h.cfg.Version}
+	if h.cfg.RequestLog != nil {
+		rs := h.cfg.RequestLog.Snapshot()
+		if !rs.StartedAt.IsZero() {
+			snap.Uptime = time.Since(rs.StartedAt)
+		}
+		snap.RequestsInFlight = rs.InFlight
+		snap.RequestsSucceeded = rs.Succeeded
+		snap.RequestsFailed = rs.Failed
+		snap.RequestAvgSeconds = rs.AvgDurationMs / 1000
+	}
+	if h.cfg.Pool != nil {
+		total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+		snap.AccountsTotal = total
+		snap.AccountsHealthy = healthy
+		snap.AccountsCooling = cooling
+		snap.AccountsDisabled = disabled
+		snap.AccountsInFlight = inFlightFull
+		snap.RealmServable = map[string]bool{
+			"cn":     h.cfg.Pool.ServableForRealm("cn"),
+			"global": h.cfg.Pool.ServableForRealm("global"),
+		}
+		// 逐账号：healthy 口径与 /status 一致（未禁用且未冷却）。
+		for _, st := range h.cfg.Pool.List() {
+			snap.Accounts = append(snap.Accounts, metrics.AccountMetric{
+				UID:     st.UID,
+				Credits: st.Credits,
+				Healthy: !st.Disabled && !st.Cooling,
+				Realm:   st.Realm,
+			})
+		}
+	}
+	if h.cfg.Usage != nil {
+		t := h.cfg.Usage.Totals()
+		snap.TokensPrompt = t.PromptTokens
+		snap.TokensCompletion = t.CompletionTok
+		snap.TokensTotal = t.TotalTokens
+		snap.Credits = t.Credits
+		snap.CacheHitTokens = t.CacheHitTokens
+		snap.CacheMissTokens = t.CacheMissTokens
+	}
+
+	w.Header().Set("Content-Type", metrics.ContentType)
+	// 渲染错误只可能来自 Writer（客户端提前断开），无处可报，忽略即可。
+	_ = metrics.Write(w, snap)
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {

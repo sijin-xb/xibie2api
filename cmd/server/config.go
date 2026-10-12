@@ -5,13 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
@@ -230,7 +233,28 @@ type Config struct {
 	// /v1/*——否则"收窄了钥匙权限"这件事可以被顶层万能钥匙绕过，等于没收窄。
 	APIKeys []apikey.Entry `json:"api_keys,omitempty"`
 
+	// Metrics /metrics 端点（Prometheus 文本格式）。缺省关闭：false 时该路径返回
+	// 404，对端口扫描器表现为不存在。鉴权与 /status 同口径（Bearer）。热生效。
+	Metrics struct {
+		Enabled bool `json:"enabled"`
+	} `json:"metrics"`
+
+	// Alerting 账号池可用性阈值告警：健康账号数跌破 min_healthy 时向 webhook 推
+	// 通知，恢复后再推一条。缺省关闭。webhook_url / secret / 阈值 / 冷却 / 间隔
+	// 全部热生效（监控器每轮重新读取配置）。
+	Alerting struct {
+		Enabled    bool   `json:"enabled"`
+		WebhookURL string `json:"webhook_url"` // 目标地址；enabled=true 时必填
+		Secret     string `json:"secret"`      // HMAC-SHA256 共享密钥；空 = 不签名（仅建议内网）
+		MinHealthy int    `json:"min_healthy"` // 健康账号数下限；缺省 1
+		Cooldown   string `json:"cooldown"`    // 持续故障重复提醒间隔；缺省 "30m"
+		Interval   string `json:"interval"`    // 两次评估最小间隔；缺省 "1m"
+	} `json:"alerting"`
+
 	// 解析后
+	AlertCooldownDur       time.Duration `json:"-"`
+	AlertIntervalDur       time.Duration `json:"-"`
+	AlertConfig            alert.Config  `json:"-"`
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
@@ -632,7 +656,80 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.KeyTable = kt
+	// 可用性阈值告警：解析时长、校验 webhook 地址，编译成监控器直接吃的 Config。
+	if err := c.normalizeAlerting(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeAlerting 解析并校验 alerting 段。
+//
+// 缺省值：min_healthy=1（0 会让条件"healthy < 0"永假，等于静默失效——所以 0 视为
+// 未填写并回落到 1）、cooldown=30m、interval=1m。
+//
+// 校验 fail fast（与 model_aliases / api_keys 同纪律，不静默忽略）：enabled=true 但
+// webhook_url 为空、URL 不是 http/https、时长非法或非正数，都在启动或面板保存时报错。
+// 理由：告警配错的代价是"故障时没人知道"，而这恰恰是配置错误最难被发现的地方。
+func (c *Config) normalizeAlerting() error {
+	a := &c.Alerting
+	if a.MinHealthy <= 0 {
+		a.MinHealthy = 1
+	}
+	cd, err := parsePositiveDuration("alerting.cooldown", a.Cooldown, 30*time.Minute)
+	if err != nil {
+		return err
+	}
+	iv, err := parsePositiveDuration("alerting.interval", a.Interval, time.Minute)
+	if err != nil {
+		return err
+	}
+	c.AlertCooldownDur = cd
+	c.AlertIntervalDur = iv
+
+	if a.Enabled {
+		u := strings.TrimSpace(a.WebhookURL)
+		if u == "" {
+			return errors.New("alerting.webhook_url 必填（alerting.enabled=true）")
+		}
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return fmt.Errorf("alerting.webhook_url 非法: %w", err)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("alerting.webhook_url 必须是 http/https，got %q", parsed.Scheme)
+		}
+		if parsed.Host == "" {
+			return errors.New("alerting.webhook_url 缺少主机名")
+		}
+		a.WebhookURL = u
+	}
+
+	c.AlertConfig = alert.Config{
+		Enabled:    a.Enabled,
+		WebhookURL: strings.TrimSpace(a.WebhookURL),
+		Secret:     a.Secret,
+		MinHealthy: a.MinHealthy,
+		Cooldown:   cd,
+		Interval:   iv,
+	}
+	return nil
+}
+
+// parsePositiveDuration 解析时长字段：空串用默认值；非法或非正数报错。
+func parsePositiveDuration(field, raw string, def time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s 非法: %w", field, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s 必须为正数，got %s", field, raw)
+	}
+	return d, nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

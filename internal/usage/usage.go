@@ -777,6 +777,24 @@ func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg
 	return out
 }
 
+// Totals 返回全库累计量（含已折叠的日桶）。
+//
+// 与 SnapshotWindow 的区别：只求和，不构建 by_realm/by_account/by_model 三张分组
+// 表，也不做排序与时间解析。供 /metrics 这类高频只读抓取使用——那里只关心总量，
+// 没必要每次抓取都分配三张 map。
+func (r *Recorder) Totals() Agg {
+	if r == nil {
+		return Agg{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var g aggAcc
+	for _, b := range r.buckets {
+		g.add(b)
+	}
+	return g.finish()
+}
+
 // Describe 返回一行人类可读的占用摘要（启动日志用）。
 func (r *Recorder) Describe() string {
 	if r == nil {

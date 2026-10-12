@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -239,6 +240,8 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		MetricsEnabled:       cfg.Metrics.Enabled,
+		Alert:                cfg.AlertConfig,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -329,11 +332,25 @@ func main() {
 		// 多 API Key：匹配表（模型白名单 / 出口绑定）+ 逐 Key 台账。
 		KeyTable: cfg.KeyTable,
 		KeyUsage: keyLedger,
+		// 版本号仅用于 /metrics 的 build_info 标签。
+		Version: appVersion,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 可用性阈值告警监控：每轮重新读 livecfg 里的配置（因此面板改阈值/地址/开关
+	// 即刻生效），count 直接问池子要当前口径的数字，不在这里另存一份副本。
+	// **恒启动**（即便启动时关闭）：否则"启动时关闭、之后在面板里打开"将永远不会
+	// 有监控在跑。关闭态下每轮只是读一次配置就返回，代价可忽略。
+	mon := alert.New(server.ServiceName, appVersion,
+		func() alert.Config { return live.Load().Alert },
+		func() (int, int) { t, h, _, _, _ := p.CountsDetailed(); return t, h })
+	if cfg.Alerting.Enabled {
+		log.Printf("[alert] 可用性告警已启用：健康账号 < %d 时推送 %s（冷却 %s，评估间隔 %s）",
+			cfg.Alerting.MinHealthy, cfg.Alerting.WebhookURL, cfg.AlertCooldownDur, cfg.AlertIntervalDur)
+	}
+	go mon.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
@@ -504,6 +521,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		MetricsEnabled:       newCfg.Metrics.Enabled,
+		Alert:                newCfg.AlertConfig,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

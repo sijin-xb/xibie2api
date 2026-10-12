@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 )
 
@@ -22,6 +23,8 @@ type Snapshot struct {
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	MetricsEnabled       bool          // /metrics 端点开关（false 时返回 404）
+	Alert                alert.Config  // 可用性阈值告警配置（监控器每轮重新读取）
 }
 
 // Holder 原子持有当前快照。
