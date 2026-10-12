@@ -35,6 +35,8 @@ type turnParams struct {
 	chatMeta      upstream.ChatMeta // 会话头族
 	degraded      bool              // 初始 degradedApplied
 	renderer      turnRenderer      // 协议相关的响应渲染边界（OpenAI Chat Completions）
+	keyFP         string            // API Key 指纹（空 = 顶层单 key / 未鉴权，不记逐 Key 台账）
+	keyName       string            // API Key 备注名（台账与日志展示用）
 }
 
 // runTurn 执行单轮上游调用：选号 -> 租约 -> 刷新 -> 出站 -> 成功渲染
@@ -614,28 +616,38 @@ func (h *Handler) recordAttempt(st *chatStat, p *turnParams, uid string, delta p
 	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
 	// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
 	// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
+	//
+	// 逐 Key 台账与用量记录共用同一个 Delta 与同一个 ok 判定：两处各建一份迟早会
+	// 漂移（"用量视图和 Key 台账对不上"是最难查的一类问题），共用是防分叉的唯一办法。
+	ud := usage.Delta{
+		PromptTokens:     delta.PromptTokens,
+		HasPromptTokens:  delta.HasPromptTokens,
+		CompletionTokens: delta.CompletionTokens,
+		HasCompletion:    delta.HasCompletionTokens,
+		TotalTokens:      delta.TotalTokens,
+		HasTotal:         delta.HasTotalTokens,
+		Credit:           credit,
+		HasCredit:        hasCredit,
+		HasCacheTokens:   st.hasCache,
+		CacheHitTokens:   st.cacheHit,
+		CacheMissTokens:  st.cacheMiss,
+		ModelRate:        p.modelRate,
+		LatencyMs:        delta.LatencyMs,
+		HasLatency:       delta.HasLatencyMs,
+		TokensPerSecond:  delta.TokensPerSecond,
+		HasTPS:           delta.HasTokensPerSecond,
+	}
+	attemptOK := delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens
 	if h.cfg.Usage != nil {
 		realm := "cn"
 		if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 			realm = a.Realm
 		}
-		h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
-			PromptTokens:     delta.PromptTokens,
-			HasPromptTokens:  delta.HasPromptTokens,
-			CompletionTokens: delta.CompletionTokens,
-			HasCompletion:    delta.HasCompletionTokens,
-			TotalTokens:      delta.TotalTokens,
-			HasTotal:         delta.HasTotalTokens,
-			Credit:           credit,
-			HasCredit:        hasCredit,
-			HasCacheTokens:   st.hasCache,
-			CacheHitTokens:   st.cacheHit,
-			CacheMissTokens:  st.cacheMiss,
-			ModelRate:        p.modelRate,
-			LatencyMs:        delta.LatencyMs,
-			HasLatency:       delta.HasLatencyMs,
-			TokensPerSecond:  delta.TokensPerSecond,
-			HasTPS:           delta.HasTokensPerSecond,
-		}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, ud, attemptOK)
+	}
+	// 逐 API Key 台账：仅当请求来自一条显式配置的 api_keys 条目（p.keyFP 非空）时
+	// 落一行。顶层单 key 与不鉴权模式指纹为空，Ledger 内部直接返回，不产生噪音行。
+	if h.cfg.KeyUsage != nil {
+		h.cfg.KeyUsage.Add(time.Now(), p.keyFP, p.keyName, ud, attemptOK)
 	}
 }

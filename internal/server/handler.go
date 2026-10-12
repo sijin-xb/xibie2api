@@ -15,8 +15,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -64,6 +66,15 @@ type Config struct {
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
 
+	// KeyUsage 逐 API Key 台账（可选；nil = 不记录）。与 Usage 同点调用，
+	// 只有请求来自一条显式配置的 api_keys 条目时才落一行（顶层单 key 与
+	// 不鉴权模式指纹为空，不产生台账行）。
+	KeyUsage *keyusage.Ledger
+
+	// KeyTable 多 API Key 匹配表（config api_keys 编译产物）。nil = 未配置，
+	// 鉴权回落 APIKey 单密钥语义——老配置零变化。Live 同时给出时 Live 优先。
+	KeyTable *apikey.Table
+
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
@@ -86,6 +97,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 	return livecfg.Snapshot{
 		APIKey:           h.cfg.APIKey,
+		Keys:             h.cfg.KeyTable,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
@@ -177,13 +189,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// apiKeyIdentityKey 请求上下文里承载鉴权身份的键。
+type apiKeyIdentityKey struct{}
+
+// authenticate 校验入站请求并返回调用方身份。
+//
+// 两条路径，互斥且口径明确：
+//   - 配了 api_keys（live.Keys != nil）→ 走匹配表，命中返回该条目的模型白名单/域绑定；
+//   - 否则 → 回落顶层单 api_key 的既有语义（空 = 不鉴权），身份为零值（不限制）。
+//
+// 不把两种情形混在一张表里，是为了让"老配置行为逐字节不变"这件事在代码结构上
+// 一眼可见——回落分支就是引入本功能之前的原实现。
+func (h *Handler) authenticate(r *http.Request) (apikey.Identity, bool) {
+	live := h.loadLive()
+	if live.Keys != nil {
+		return live.Keys.Authenticate(r)
+	}
+	if !httpauth.VerifyBearer(r, live.APIKey) {
+		return apikey.Identity{}, false
+	}
+	return apikey.Identity{}, true
+}
+
+// apiKeyIdentityFrom 取出请求上下文里的鉴权身份；未经 withAuth 的路径返回零值
+// （零值身份不限制任何模型/域，因此漏注入不会误拦请求，只会少一层白名单）。
+func apiKeyIdentityFrom(r *http.Request) apikey.Identity {
+	if v, ok := r.Context().Value(apiKeyIdentityKey{}).(apikey.Identity); ok {
+		return v
+	}
+	return apikey.Identity{}
+}
+
+// withAuth 校验 Bearer 密钥，并把命中的身份注入请求上下文供 prepareTurn 做
+// 模型白名单 / 域绑定判定与逐 Key 台账归属。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := h.authenticate(r)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), apiKeyIdentityKey{}, id)))
 	}
 }
 
@@ -528,7 +574,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	st, p := h.prepareTurn(r, body, openAIRenderer{})
+	st, p, derr := h.prepareTurn(r, body, openAIRenderer{})
+	if derr != nil {
+		writeOpenAIError(w, derr.status, derr.code, derr.message)
+		return
+	}
 	defer st.done()
 	h.runTurn(r.Context(), w, st, p)
 }

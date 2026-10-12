@@ -85,5 +85,6 @@
     "ttl": "30m",
     "gc_interval": "5m"
   },
-  "model_aliases": []
+  "model_aliases": [],
+  "api_keys": []
 }

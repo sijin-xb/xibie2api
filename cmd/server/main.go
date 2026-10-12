@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -234,6 +235,7 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		Keys:                 cfg.KeyTable,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
@@ -245,6 +247,17 @@ func main() {
 	rec.Start()
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
+	// 逐 API Key 台账：独立文件（不与 usage.json 混存），只记指纹与备注名。
+	// 未配置 api_keys 时不会有任何行，文件保持不存在。
+	keyUsagePath := stateSibling(cfg.StateFile, "key-usage.json")
+	keyLedger := keyusage.New(keyUsagePath)
+	keyLedger.Start()
+	defer keyLedger.Stop()
+	// 计数用"启用中的条目"而非配置数组长度——禁用条目不算生效的钥匙。
+	if n := len(cfg.KeyTable.Entries()); n > 0 {
+		log.Printf("[keyusage] 多 API Key 已启用：%d 把（台账 %s）", n, keyUsagePath)
+	}
 
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
@@ -265,6 +278,7 @@ func main() {
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
+		KeyUsage:    keyLedger,
 		RequestLog:  requestLog,
 		Upstream:    up,
 		Scheduler:   sch,
@@ -312,6 +326,9 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型别名表（#5）：外部模型名 → 网关目标模型名的精确匹配；nil = 无别名。
 		ModelAliases: cfg.AliasTable,
+		// 多 API Key：匹配表（模型白名单 / 出口绑定）+ 逐 Key 台账。
+		KeyTable: cfg.KeyTable,
+		KeyUsage: keyLedger,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -483,6 +500,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		Keys:                 newCfg.KeyTable,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,

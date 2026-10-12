@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -9,6 +10,17 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
+
+// keyDenyError 请求级拒绝：该 API Key 的模型白名单或出口绑定不允许本次请求。
+//
+// 携带协议无关的四元组，由各协议入口映射成自己的错误信封（OpenAI / Anthropic /
+// Responses 三套信封字段名不同）。拒绝发生在网关本地，不选号、不出站、不消耗额度。
+type keyDenyError struct {
+	status  int
+	code    string // 机器可读原因：model_not_allowed / realm_not_allowed
+	param   string
+	message string
+}
 
 // prepareTurn 是协议无关的「请求准备层」：把入站请求体（始终为 OpenAI Chat
 // Completions 形态）归一化为单轮执行所需的 chatStat + turnParams，然后交由
@@ -25,7 +37,9 @@ import (
 //   - 本方法只读 r 的 Header/Context（ExtractClientIP / requestTrace / 会话头），
 //     不读 r.Body（body 由调用方读入后传入，读错误由调用方就地 400）。
 //   - 返回值 st 的 done() 由调用方 defer；p.renderer 由调用方注入。
-func (h *Handler) prepareTurn(r *http.Request, body []byte, renderer turnRenderer) (*chatStat, *turnParams) {
+//   - 第三个返回值非 nil 表示「本请求被 API Key 约束拒绝」：此时 st 与 p 均为 nil，
+//     调用方**先判错再 defer st.done()**（顺序反了会空指针），按自己的协议信封写 400。
+func (h *Handler) prepareTurn(r *http.Request, body []byte, renderer turnRenderer) (*chatStat, *turnParams, *keyDenyError) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -55,6 +69,34 @@ func (h *Handler) prepareTurn(r *http.Request, body []byte, renderer turnRendere
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(effectiveModel)
+
+	// 多 API Key 约束（config api_keys）：模型白名单 + 出口绑定。
+	//
+	// 位置是刻意的：在「别名替换 + realm 解析之后」——此时才知道本次请求实际要哪个
+	// 模型、落在哪个域，别名命中的目标名也参与白名单判定（否则给别名起的名字会
+	// 绕过白名单）；在「创建统计对象之前」——被拒的请求除请求日志外不产生任何副作用。
+	//
+	// 越权请求在网关本地 400 挡掉：不选号、不出站、不消耗任何额度。身份零值
+	// （未配置 api_keys / 走顶层单 key / 未鉴权）时 Configured() 为 false，整段跳过，
+	// 老配置行为逐字节不变。
+	keyID := apiKeyIdentityFrom(r)
+	if keyID.Configured() {
+		if !keyID.Allows(effectiveModel, bareModel) {
+			return nil, nil, &keyDenyError{
+				status:  http.StatusBadRequest,
+				code:    "model_not_allowed",
+				param:   "model",
+				message: fmt.Sprintf("this API key is not allowed to use model %q", peek.Model),
+			}
+		}
+		// 出口绑定覆盖模型名上的 realm 前缀（空 = 跟随请求）。覆盖发生在 modelRate
+		// 计算之前，因此计费倍率、选号域、粘性键、出站裸名全部按覆盖后的域走，不会
+		// 出现"按 global 选号却按 cn 计价"的错配。
+		if ov := keyID.RealmOverride(); ov != "" {
+			realm = ov
+		}
+	}
+
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -174,6 +216,8 @@ func (h *Handler) prepareTurn(r *http.Request, body []byte, renderer turnRendere
 		chatMeta:      chatMeta,
 		degraded:      degradedApplied,
 		renderer:      renderer,
+		keyFP:         keyID.Fingerprint,
+		keyName:       keyID.Name,
 	}
-	return st, p
+	return st, p, nil
 }

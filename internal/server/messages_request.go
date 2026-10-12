@@ -31,14 +31,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"strings"
-
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 )
 
 // messagesMeta 承载 Anthropic 响应对象回显所需的原始请求字段（归一化后的 OpenAI
@@ -75,21 +74,26 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		writeMessagesError(w, merr.status, merr.typ, merr.message)
 		return
 	}
-	st, p := h.prepareTurn(r, openAIBody, messagesRenderer{meta: meta})
+	st, p, derr := h.prepareTurn(r, openAIBody, messagesRenderer{meta: meta})
+	if derr != nil {
+		writeMessagesError(w, derr.status, "invalid_request_error", derr.message)
+		return
+	}
 	defer st.done()
 	h.runTurn(r.Context(), w, st, p)
 }
 
-// withAuthMessages 是 /v1/messages 的鉴权包装：复用 httpauth.VerifyBearer 与热改
-// api_key（loadLive），失败时写 **Anthropic** 错误信封（401 authentication_error），
-// 与 OpenAI 路径的 withAuth 互不影响。
+// withAuthMessages 是 /v1/messages 的鉴权包装：复用 h.authenticate（多 API Key
+// 匹配表 + 热改 api_key），失败时写 **Anthropic** 错误信封（401 authentication_error），
+// 与 OpenAI 路径的 withAuth 互不影响。命中身份同样注入上下文，供白名单判定与台账归属。
 func (h *Handler) withAuthMessages(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := h.authenticate(r)
+		if !ok {
 			writeMessagesError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), apiKeyIdentityKey{}, id)))
 	}
 }
 

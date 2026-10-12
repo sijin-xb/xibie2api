@@ -166,6 +166,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
+| **多 API Key（`api_keys`）** | 每把钥匙各自限定可调用的模型（`*`/`?` 通配）与出口域（`cn`/`global`），越权请求在网关本地 400 挡掉、不消耗额度；匹配常量时间、支持热生效。附逐 Key 用量台账（`data/key-usage.json`，只存指纹与备注名，不存密钥原文）+ 面板「用量 → API Key 用量」视图。未配置时行为与引入前逐字节一致 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
 
@@ -415,6 +416,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
 | `model_aliases` | `[]` | **模型别名映射**（#5）：数组，元素 `{"from":"外部模型名","to":"网关目标模型名"}`。精确匹配；命中后把请求模型名替换为 `to`（可带 `cn:`/`global:` 前缀或裸名），再走既有 realm 解析与选号/策略管线。空/缺省 = 无别名（行为不变）。`from` 不得含 `:`；重复 `from`、`from` 含 `:`/空白/`*`、`to` 为空或含空白/`*`、链式别名均在启动/保存时**报错**（fail fast） |
+| `api_keys` | `[]` | **多 API Key**：数组，元素 `{"key":"...","name":"...","models":["glm-*"],"realm":"global","enabled":true}`。每把钥匙各自限定可调用的模型（支持 `*`/`?` 通配）与出口域。空/缺省 = 不启用，鉴权完全回落顶层 `api_key`（行为逐字节不变）。配了之后顶层 `api_key` **不再放行 `/v1/*`**（退居面板后备密钥）。详见[多 API Key](#多-api-keyapi_keys) |
 
 ### 模型别名映射（`model_aliases`）
 
@@ -436,6 +438,45 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 单跳：`to` 不能是另一个别名的 `from`（不支持链式）。
 
 校验（启动 / 面板保存配置时 fail fast，不静默忽略）：`from`/`to` 为空、`from` 含 `:`/空白/`*`、`to` 含空白/`*`、`from` 重复（映射冲突）、`to` 解析后为空、链式别名。目标模型是否真实存在由上游运行时判定（未知模型走上游错误码与既有错误提示链路）。
+
+### 多 API Key（`api_keys`）
+
+把「谁能调什么」收窄到钥匙粒度：手机端只给便宜模型、Codex 专用钥匙只绑国际域、自动化脚本的钥匙不给贵模型。
+
+```json
+"api_keys": [
+  { "key": "sk-codex-xxxx", "name": "Codex App", "models": ["gpt-*"], "realm": "global" },
+  { "key": "sk-phone-xxxx", "name": "手机端", "models": ["glm-*", "deepseek*"] },
+  { "key": "sk-auto-xxxx", "name": "自动化脚本", "models": [] },
+  { "key": "sk-retired-xxxx", "name": "已停用", "enabled": false }
+]
+```
+
+| 字段 | 说明 |
+|---|---|
+| `key` | 密钥原文；启用中的条目为空会在启动时报错（避免"配了但永远匹配不上"的哑配置） |
+| `name` | 备注名，用于日志、面板与报错文案；可空 |
+| `models` | 允许的模型，支持 `*` / `?` 通配（大小写不敏感）；空数组 = 不限制 |
+| `realm` | 出口绑定 `cn` / `global`，**覆盖**模型名上的 `[realm:]` 前缀；留空 = 跟随请求 |
+| `enabled` | 缺省 `true`；`false` 时该条目不参与匹配（允许把 `key` 清空，便于"先禁用、回头换密钥"） |
+
+行为要点：
+
+- **越权请求在网关本地 400 挡掉**：不选号、不出站、不消耗任何额度。OpenAI / Responses 路径给出机器可读码 `model_not_allowed`；Anthropic 信封本身没有 `code` 字段（与既有错误口径一致），文案里带被拒的模型名。
+- **配了 `api_keys` 之后，顶层 `api_key` 不再放行 `/v1/*`**，退居面板 / 管理接口的后备密钥。否则"收窄权限"可以被万能钥匙绕过，等于没收窄。想继续用单密钥就别配 `api_keys`。
+- **匹配是常量时间的**：`SHA-256` 摘要 + `subtle.ConstantTimeCompare`，逐条比较且不提前返回，命中索引用常量时间选择累积，耗时与命中位置无关。
+- **白名单在别名替换之后判定**：别名命中的目标名同样参与白名单（否则"给别名起的名字"会成为绕过白名单的后门）。
+- **热生效**：面板保存配置即在线替换匹配表，无需重启（`api_keys` 不在需重启字段清单里）。
+- **未配置时行为与引入前逐字节一致**：回落顶层 `api_key` 的单密钥语义。
+- 校验 fail fast：启用条目密钥为空 / 含空白 / 含 `*`、密钥重复、`realm` 非法、`models` 含空模式，都在启动或面板保存时报错。
+
+逐 Key 用量台账：
+
+- 面板「用量 → API Key 用量」查看，或 `GET /panel/api/key_usage?days=N`（`0` = 全部历史，`1` = 今天，`7`/`30` 等按最近 N 个本地日）。
+- 台账落 `data/key-usage.json`，**只存密钥指纹（sha256 前 8 字节）与备注名，不存密钥原文**——台账可能被备份、同步或贴进 issue，存原文等于把密钥扩散到它不该去的地方。
+- 按钥匙归集请求数 / 失败数 / prompt / completion / 合计 token / 积分 / 活跃天 / 最近使用，可切窗口。
+- **配置里配了但一次没用过的钥匙也占一行**，否则"某把钥匙是不是没人用"无法回答。
+- 只有来自显式配置条目的请求才落台账行（顶层单 key 与不鉴权模式不产生行）。
 
 ### 上游超时语义（三段各归其位）
 
@@ -712,7 +753,7 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET key_usage`（`days`，0 = 全部）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |

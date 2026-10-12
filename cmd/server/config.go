@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 )
@@ -221,6 +222,14 @@ type Config struct {
 	// 校验与构建见 normalize（非法配置 fail fast，不静默忽略）。
 	ModelAliases []server.ModelAlias `json:"model_aliases,omitempty"`
 
+	// APIKeys 多 API Key 配置：每把钥匙各自限定可调用的模型（支持 * / ? 通配）
+	// 与出口域（cn / global）。缺省空 = 不启用，鉴权完全回落顶层 api_key 单密钥
+	// 语义（老配置行为零变化）。校验与构建见 normalize（fail fast）。
+	//
+	// 配了 api_keys 之后，顶层 api_key 退居面板/管理接口的后备密钥，不再放行
+	// /v1/*——否则"收窄了钥匙权限"这件事可以被顶层万能钥匙绕过，等于没收窄。
+	APIKeys []apikey.Entry `json:"api_keys,omitempty"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -238,6 +247,9 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// AliasTable 解析后的别名表（normalize 构建）；nil = 无别名。
 	AliasTable *server.AliasTable `json:"-"`
+	// KeyTable 解析后的多 API Key 匹配表（normalize 构建）；恒非 nil（至少含顶层
+	// api_key 或"不鉴权"语义），因此调用方无需判空。
+	KeyTable *apikey.Table `json:"-"`
 }
 
 // Default 默认配置。
@@ -612,6 +624,14 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.AliasTable = tbl
+	// 多 API Key 匹配表：空 = 未启用（KeyTable 为只含顶层 api_key 的表，行为不变）；
+	// 非空则逐条校验并编译（空密钥 / 重复密钥 / 非法 realm / 密钥含空白或 '*' 均
+	// fail fast——"配了但永远匹配不上"的哑配置比启动失败更难查）。
+	kt, err := apikey.NewTable(c.APIKeys, c.APIKey)
+	if err != nil {
+		return err
+	}
+	c.KeyTable = kt
 	return c.normalizePrompt()
 }
 
