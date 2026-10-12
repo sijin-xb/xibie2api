@@ -2312,6 +2312,66 @@ async function loadUsage() {
     $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
+  // 逐 API Key 台账独立拉取：它的窗口（days）与上方用量窗口无关，用量失败也不该
+  // 连坐——台账读的是本地文件，几乎不会失败。
+  loadKeyUsage();
+}
+
+/* ── 逐 API Key 用量台账 ───────────────────────────────────────────── */
+/* 数据源是网关的 data/key-usage.json（只存密钥指纹与备注名，不存密钥原文），
+   窗口独立于上方用量视图。配置里配了但一次没用过的钥匙也会返回，占一行零值——
+   否则「某把钥匙是不是没人用」在面板上无法回答。 */
+let kuDays = 7;
+
+async function loadKeyUsage() {
+  try {
+    renderKeyUsage(await api('key_usage?days=' + kuDays));
+  } catch (e) {
+    $('kuHead').innerHTML = '';
+    $('kuBody').innerHTML = '<tr><td colspan="11" class="empty">读取 API Key 用量失败：' + esc(e.message) + '</td></tr>';
+    $('kuNote').textContent = '—';
+  }
+}
+
+function renderKeyUsage(d) {
+  const rows = d.rows || [];
+  $('kuHead').innerHTML =
+    '<tr><th class="mark" aria-hidden="true"></th><th>API Key</th><th>指纹</th>' +
+    '<th class="num">请求</th><th class="num">失败</th>' +
+    '<th class="num">prompt</th><th class="num">completion</th><th class="num">合计 Token</th>' +
+    '<th class="num">积分</th><th class="num">活跃天</th><th>最近使用</th></tr>';
+  $('kuBody').innerHTML = rows.map(r => {
+    const name = r.name ? esc(r.name) : '<span class="muted">（未命名）</span>';
+    const last = r.last_used
+      ? esc(fmtLocalDateTime(Date.parse(r.last_used)))
+      : '<span class="muted">从未使用</span>';
+    const errs = Number(r.errors || 0);
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + name + '</td>' +
+      '<td class="num">' + esc(r.fingerprint || '') + '</td>' +
+      '<td class="num">' + Number(r.requests || 0).toLocaleString() + '</td>' +
+      '<td class="num">' + (errs ? '<span style="color:var(--warn)">' + errs.toLocaleString() + '</span>' : '0') + '</td>' +
+      '<td class="num">' + fmtTok(r.prompt_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(r.completion_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(r.total_tokens) + '</td>' +
+      '<td class="num">' + fmtCredit(r.credits) + '</td>' +
+      '<td class="num">' + Number(r.active_days || 0) + '</td>' +
+      '<td class="num">' + last + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="11" class="empty">暂无台账（未配置 api_keys 时不产生台账行）</td></tr>';
+  const win = kuDays === 0 ? '全部历史' : (kuDays === 1 ? '今天' : '近 ' + kuDays + ' 天');
+  $('kuNote').textContent = rows.length + ' 把钥匙 · ' + win + ' · 只记指纹，不存密钥原文';
+}
+
+if ($('kuRange')) {
+  $('kuRange').onclick = e => {
+    const b = e.target.closest('button[data-days]');
+    if (!b) return;
+    kuDays = Number(b.dataset.days);
+    $('kuRange').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    loadKeyUsage();
+  };
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;

@@ -874,6 +874,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
+          <h3>API Key 用量</h3>
+          <span class="vtabs" id="kuRange">
+            <button data-days="1">今天</button>
+            <button data-days="7" class="on">近 7 天</button>
+            <button data-days="30">近 30 天</button>
+            <button data-days="0">全部</button>
+          </span>
+          <span class="grow"></span>
+          <span class="note" id="kuNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead id="kuHead"></thead>
+            <tbody id="kuBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
           <h3>积分扣除历史</h3>
           <span class="vtabs" id="usCreditTabs">
             <button data-dim="account" class="on">按账号</button>
