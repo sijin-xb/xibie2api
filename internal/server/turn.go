@@ -294,6 +294,13 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
+			// 上游 429 共享维度 fail-fast（对称 WAF IP 级）：无权威恢复时刻的账号级
+			// 429 若命中共享维度门（applyErrorPolicy 已记账，此处只读激活态，避免重复
+			// 计数），终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP/设备
+			// 指纹。该轮已跳过账号级软冷却（不误罚号，见 isSharedDimensionRateLimit）。
+			if kind == upstream.ErrSoftRate && h.isSharedDimensionRateLimit(string(respBody), uerr) && h.rateIP.active() {
+				break
+			}
 			if !rotateBackoff(i, ctx) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
@@ -523,7 +530,13 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
-			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+			if h.rateIP.active() {
+				// 共享维度（出口 IP/设备指纹）限流措辞：轮转已 fail-fast、账号未被逐号
+				// 冷却。换号不换 IP，客户端提前重试无意义，等窗口过去即可。
+				msg = "upstream rate limited the gateway's shared egress (ip/device), rotation stopped; retry after a short wait"
+			} else {
+				msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+			}
 		case upstream.ErrWafBlock:
 			if h.wafIP.active() {
 				// IP 级拦截措辞（fail-fast 终止路径）：网关出口 IP 被 WAF 拦截、

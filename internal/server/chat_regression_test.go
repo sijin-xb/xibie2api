@@ -144,6 +144,20 @@ data: [DONE]
 
 `
 
+// regReasoningSSE：推理模型先流 reasoning_content（思维链），再流 content（正文）。
+// 用于验证 Anthropic /v1/messages 渲染把思维链映射为 thinking 块（而非丢弃）。
+const regReasoningSSE = `data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先算"}}]}
+
+data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"17乘23"}}]}
+
+data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"391"}}]}
+
+data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9,"total_tokens":14}}
+
+data: [DONE]
+
+`
+
 // ---------------------------------------------------------------------------
 // 1. 非流式请求：上游 SSE 聚合为 chat.completion，响应体逐字节。
 // ---------------------------------------------------------------------------

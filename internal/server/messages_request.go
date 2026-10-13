@@ -39,6 +39,8 @@ import (
 	"math"
 	"net/http"
 	"strings"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/websearch"
 )
 
 // messagesMeta 承载 Anthropic 响应对象回显所需的原始请求字段（归一化后的 OpenAI
@@ -46,6 +48,20 @@ import (
 type messagesMeta struct {
 	model  string // 原始客户端 model（回显）
 	stream bool
+	// webSearch 非 nil = 客户端声明了 web_search 服务端工具（Anthropic 服务端检索）。
+	// 归一化阶段只记录声明与查询串；检索结果由 handler 在出站前回填（results/err），
+	// 渲染层据此产出 server_tool_use + web_search_tool_result 内容块。
+	webSearch *messagesWebSearch
+}
+
+// messagesWebSearch 一次 web_search 服务端工具的请求态 + 执行结果。
+type messagesWebSearch struct {
+	maxUses        int
+	allowedDomains []string
+	blockedDomains []string
+	query          string // 从最后一条 user 消息提取的查询串
+	results        []websearch.Result
+	err            string // 非空 = 检索失败（渲染为 web_search_tool_result_error）
 }
 
 // messagesError 归一化/读体阶段的请求级错误（映射为 Anthropic 错误信封）。
@@ -81,6 +97,13 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer st.done()
+	// web_search 服务端工具：出站前实际检索（可用模型提炼查询串，故放在 prepareTurn
+	// 之后以复用选号/realm），结果回填 meta（渲染层据此产出 server_tool_use +
+	// web_search_tool_result 内容块），并作为一条 system 消息注入出站 prompt。
+	if meta.webSearch != nil {
+		h.runWebSearch(r.Context(), meta.webSearch, p)
+		p.body = injectSearchContext(p.body, meta.webSearch.results)
+	}
 	h.runTurn(r.Context(), w, st, p)
 }
 
@@ -268,7 +291,7 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 		oMsgs = append([]any{map[string]any{"role": "system", "content": system}}, oMsgs...)
 	}
 
-	oTools, merr := mapAnthropicTools(tools)
+	oTools, webSearch, merr := mapAnthropicTools(tools, messagesArr)
 	if merr != nil {
 		return nil, messagesMeta{}, merr
 	}
@@ -309,7 +332,7 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 	if jerr != nil {
 		return nil, messagesMeta{}, invalidMessages("", "failed to encode normalized request: "+jerr.Error())
 	}
-	return out, messagesMeta{model: model, stream: stream}, nil
+	return out, messagesMeta{model: model, stream: stream, webSearch: webSearch}, nil
 }
 
 // normalizeMessagesArray 把 Anthropic messages 数组逐条归一化为 OpenAI messages。
@@ -335,11 +358,17 @@ func normalizeMessagesArray(messages []any) ([]any, *messagesError) {
 			if merr != nil {
 				return nil, merr
 			}
+			if msg == nil {
+				continue // 整条 assistant 消息的块都被丢弃（如只含 thinking）→ 跳过
+			}
 			out = append(out, msg)
 		case "system":
 			msg, merr := normalizeSystemMessage(obj, i)
 			if merr != nil {
 				return nil, merr
+			}
+			if msg == nil {
+				continue // 整条 system 消息的块都被丢弃 → 跳过
 			}
 			out = append(out, msg)
 		default:
@@ -401,13 +430,12 @@ func normalizeUserMessage(obj map[string]any, i int) ([]any, *messagesError) {
 				}
 				out = append(out, toolMsg)
 			default:
-				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].type", i, j),
-					fmt.Sprintf("unsupported content block type %q", typ))
+				dropContentBlock(fmt.Sprintf("messages[%d].content[%d]", i, j), typ)
 			}
 		}
 		flush()
 		if len(out) == 0 {
-			// 空 content 数组：落一条空 user 消息，保持消息计数（不丢轮次）。
+			// 空 content 数组（或全部块被丢弃）：落一条空 user 消息，保持消息计数（不丢轮次）。
 			out = append(out, map[string]any{"role": "user", "content": ""})
 		}
 		return out, nil
@@ -418,6 +446,12 @@ func normalizeUserMessage(obj map[string]any, i int) ([]any, *messagesError) {
 
 // normalizeAssistantMessage 归一化一条 assistant 消息：文本块拼成 content，tool_use
 // 块汇成 tool_calls（同一 assistant 消息内 text + tool_use 共存）。
+//
+// 非 text/tool_use 的块（thinking / redacted_thinking / server_tool_use /
+// web_search_tool_result，以及未知类型）**丢弃而非 400**：客户端回放的会话历史里会
+// 带这些块（思考块随每次对话被回传、服务端检索块是本网关自己产出的），上游 OpenAI
+// 形态无法表达它们。若因此整条 assistant 消息为空（只含被丢弃的块），返回 nil 让
+// 调用方跳过——空 assistant 消息同样会被上游拒绝。见文件头「设计纪律」。
 func normalizeAssistantMessage(obj map[string]any, i int) (any, *messagesError) {
 	switch v := obj["content"].(type) {
 	case string:
@@ -442,11 +476,14 @@ func normalizeAssistantMessage(obj map[string]any, i int) (any, *messagesError) 
 				}
 				toolCalls = append(toolCalls, tc)
 			default:
-				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].type", i, j),
-					fmt.Sprintf("unsupported content block type %q", typ))
+				dropContentBlock(fmt.Sprintf("messages[%d].content[%d]", i, j), typ)
 			}
 		}
-		msg := map[string]any{"role": "assistant", "content": strings.Join(texts, "")}
+		content := strings.Join(texts, "")
+		if content == "" && len(toolCalls) == 0 {
+			return nil, nil // 全部块被丢弃 → 跳过该条空 assistant 消息
+		}
+		msg := map[string]any{"role": "assistant", "content": content}
 		if len(toolCalls) > 0 {
 			msg["tool_calls"] = toolCalls
 		}
@@ -474,11 +511,16 @@ func normalizeSystemMessage(obj map[string]any, i int) (any, *messagesError) {
 			}
 			typ, _ := block["type"].(string)
 			if typ != "text" {
-				return nil, invalidMessages(fmt.Sprintf("messages[%d].content[%d].type", i, j),
-					fmt.Sprintf("unsupported system content block type %q", typ))
+				// 非 text 块（如 thinking）丢弃而非 400：中途 system 消息承载的是
+				// 客户端提醒，不该因一个无法表达的块让整轮失败。
+				dropContentBlock(fmt.Sprintf("messages[%d].content[%d]", i, j), typ)
+				continue
 			}
 			txt, _ := block["text"].(string)
 			sb.WriteString(txt)
+		}
+		if sb.Len() == 0 {
+			return nil, nil // 全部块被丢弃 → 跳过该条空 system 消息
 		}
 		return map[string]any{"role": "system", "content": sb.String()}, nil
 	default:
@@ -635,19 +677,42 @@ func mapAnthropicSystem(system any) (string, *messagesError) {
 }
 
 // mapAnthropicTools 把 Anthropic 工具定义映射为 OpenAI 嵌套 function 形态。
-func mapAnthropicTools(tools []any) ([]any, *messagesError) {
+//
+// 服务端工具（tools[].type 形如 web_search_20250305 / web_search_20260209）**不**
+// 是 function 工具：它们是 Anthropic 侧执行的检索能力，转发成 function 会让上游
+// 吐一个客户端无从执行的调用（客户端期待的是服务端 web_search_tool_result）。
+// 因此这里识别并**剥离**它们，把 web_search 的声明（max_uses / 域名过滤）与查询
+// 串（取自最后一条 user 消息）交给 messagesWebSearch，由 handler 实际检索。
+// 其余未知服务端工具（如 web_fetch）一并剥离并记 WARN，绝不当作 function 转发。
+func mapAnthropicTools(tools []any, messages []any) ([]any, *messagesWebSearch, *messagesError) {
 	if tools == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
+	var ws *messagesWebSearch
 	out := make([]any, 0, len(tools))
 	for i, t := range tools {
 		tool, ok := t.(map[string]any)
 		if !ok {
-			return nil, invalidMessages(fmt.Sprintf("tools[%d]", i), "tool must be an object")
+			return nil, nil, invalidMessages(fmt.Sprintf("tools[%d]", i), "tool must be an object")
+		}
+		if styp, _ := tool["type"].(string); strings.TrimSpace(styp) != "" {
+			// 服务端工具：按类型分派，不进入 function 工具列表。
+			if strings.HasPrefix(styp, "web_search") {
+				if ws == nil {
+					ws = &messagesWebSearch{query: lastUserText(messages)}
+					ws.maxUses = int(numberField(tool, "max_uses"))
+					ws.allowedDomains = stringSlice(tool["allowed_domains"])
+					ws.blockedDomains = stringSlice(tool["blocked_domains"])
+				}
+			} else {
+				log.Printf("WARN: [server] messages: server tool %q (type %q) is not supported by the gateway and was dropped",
+					tool["name"], styp)
+			}
+			continue
 		}
 		name, _ := tool["name"].(string)
 		if strings.TrimSpace(name) == "" {
-			return nil, invalidMessages(fmt.Sprintf("tools[%d].name", i), "tool name is required")
+			return nil, nil, invalidMessages(fmt.Sprintf("tools[%d].name", i), "tool name is required")
 		}
 		fn := map[string]any{"name": name}
 		if desc, ok := tool["description"].(string); ok {
@@ -658,7 +723,83 @@ func mapAnthropicTools(tools []any) ([]any, *messagesError) {
 		}
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
-	return out, nil
+	if len(out) == 0 {
+		out = nil
+	}
+	return out, ws, nil
+}
+
+// dropContentBlock 记录并丢弃一个上游 OpenAI 形态无法表达的内容块。见文件头
+// 「设计纪律」：客户端回放的会话历史会带 thinking / redacted_thinking /
+// server_tool_use / web_search_tool_result 等块，逐个 400 会让**整个会话无法继续**
+// （旧聊天记录全部报错）。丢弃是安全的——这些块对上游模型不是必需输入（思考块是
+// 上一轮的过程产物，服务端检索块的信息已随正文进入历史）。
+//
+// 记 INFO 而非 WARN：这些块在开启思考/联网的会话里**每轮都出现**，WARN 会告警疲劳；
+// 未知类型同样 INFO，因为丢弃语义与已知类型一致（不转发、不报错）。
+func dropContentBlock(path, typ string) {
+	if typ == "" {
+		typ = "(missing)"
+	}
+	log.Printf("INFO: [server] messages: dropping content block %s of type %q (not expressible upstream)", path, typ)
+}
+
+// stringSlice 把 []any 里的字符串取出（非字符串项忽略）。
+func stringSlice(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// lastUserText 取最后一条 user 消息的文本内容，作为 web_search 的查询串。
+// content 为字符串直接用；为块数组时拼接 text 块。截断到 512 字符。
+func lastUserText(messages []any) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role != "user" {
+			continue
+		}
+		var sb strings.Builder
+		switch c := m["content"].(type) {
+		case string:
+			sb.WriteString(c)
+		case []any:
+			for _, b := range c {
+				bm, ok := b.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := bm["type"].(string); t == "text" {
+					if txt, _ := bm["text"].(string); txt != "" {
+						if sb.Len() > 0 {
+							sb.WriteString(" ")
+						}
+						sb.WriteString(txt)
+					}
+				}
+			}
+		}
+		q := strings.TrimSpace(sb.String())
+		if q == "" {
+			continue
+		}
+		if len(q) > 512 {
+			q = q[:512]
+		}
+		return q
+	}
+	return ""
 }
 
 // mapAnthropicToolChoice 映射 tool_choice：

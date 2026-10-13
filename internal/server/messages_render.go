@@ -79,6 +79,10 @@ type messagesToolCall struct {
 // messagesSink 是 FrameSink 的 Anthropic 实现：拥有事件状态机（message_start 惰性
 // 一次、内容块生命周期、单调 index、per-tool 状态、usage 捕获、终态收尾）。
 //
+// web_search 服务端工具：meta.webSearch 非 nil 时，message_start 之后先补发
+// server_tool_use（携带 query）+ web_search_tool_result 两个内容块，再进入常规
+// 正文/工具块——与 Anthropic 服务端检索的事件序列一致（客户端只渲染，不执行）。
+//
 // 已知限制（诚实记录，不伪造）：
 //   - message_start 的 usage.input_tokens 取「发出时已观测到的 prompt_tokens」。上游
 //     通常在**末帧**才给 usage，因此流式下 input_tokens 多为 0；output_tokens 以
@@ -95,10 +99,11 @@ type messagesSink struct {
 
 	nextIndex int
 	open      bool   // 是否有内容块处于打开状态
-	openKind  string // "text" | "tool"
+	openKind  string // "text" | "tool" | "thinking"
 	openTool  int    // openKind=="tool" 时的 OpenAI tool index
 
-	textIndex int // 已打开的 text 块 index（-1 = 无）
+	textIndex     int // 已打开的 text 块 index（-1 = 无）
+	thinkingIndex int // 已打开的 thinking 块 index（-1 = 无）
 
 	toolCalls map[int]*messagesToolCall
 	toolOrder []int
@@ -116,13 +121,87 @@ type messagesSink struct {
 
 func newMessagesSink(w io.Writer, fl http.Flusher, meta messagesMeta) *messagesSink {
 	return &messagesSink{
-		w:         w,
-		fl:        fl,
-		meta:      meta,
-		msgID:     "msg_" + randHex(16),
-		textIndex: -1,
-		toolCalls: map[int]*messagesToolCall{},
+		w:             w,
+		fl:            fl,
+		meta:          meta,
+		msgID:         "msg_" + randHex(16),
+		textIndex:     -1,
+		thinkingIndex: -1,
+		toolCalls:     map[int]*messagesToolCall{},
 	}
+}
+
+// emitSearchPrelude 在 message_start 之后补发 web_search 服务端工具的事件序列：
+// server_tool_use（input_json_delta 携带 {"query":...}）→ web_search_tool_result。
+// 索引从当前 nextIndex 起单调推进；结束后 open=false，正文块自然从下一个 index 开始。
+func (s *messagesSink) emitSearchPrelude() error {
+	ws := s.meta.webSearch
+	if ws == nil {
+		return nil
+	}
+	id := "srvtoolu_" + randHex(16)
+
+	idx := s.nextIndex
+	s.nextIndex++
+	if err := s.emit("content_block_start", map[string]any{
+		"index": idx,
+		"content_block": map[string]any{
+			"type": "server_tool_use", "id": id, "name": "web_search", "input": map[string]any{},
+		},
+	}); err != nil {
+		return err
+	}
+	partial, _ := json.Marshal(map[string]any{"query": ws.query})
+	if err := s.emit("content_block_delta", map[string]any{
+		"index": idx,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)},
+	}); err != nil {
+		return err
+	}
+	if err := s.emit("content_block_stop", map[string]any{"index": idx}); err != nil {
+		return err
+	}
+
+	ridx := s.nextIndex
+	s.nextIndex++
+	if err := s.emit("content_block_start", map[string]any{
+		"index": ridx,
+		"content_block": map[string]any{
+			"type": "web_search_tool_result", "tool_use_id": id,
+			"content": webSearchResultContent(ws),
+		},
+	}); err != nil {
+		return err
+	}
+	return s.emit("content_block_stop", map[string]any{"index": ridx})
+}
+
+// webSearchResultContent 构造 web_search_tool_result 的 content：
+// 有结果 → 结果数组；失败/空 → web_search_tool_result_error（不伪造结果）。
+func webSearchResultContent(ws *messagesWebSearch) any {
+	if ws.err != "" || len(ws.results) == 0 {
+		code := "unavailable"
+		if ws.err == "" {
+			code = "no_results"
+		}
+		return map[string]any{"type": "web_search_tool_result_error", "error_code": code}
+	}
+	arr := make([]any, 0, len(ws.results))
+	for _, r := range ws.results {
+		item := map[string]any{
+			"type":              "web_search_result",
+			"url":               r.URL,
+			"title":             r.Title,
+			"encrypted_content": "",
+		}
+		if r.PageAge != "" {
+			item["page_age"] = r.PageAge
+		} else {
+			item["page_age"] = nil
+		}
+		arr = append(arr, item)
+	}
+	return arr
 }
 
 // emit 写一条 SSE 事件：event: <name>\ndata: <json>\n\n（data 内附 type），写完 flush。
@@ -149,7 +228,7 @@ func (s *messagesSink) ensureStarted() error {
 	}
 	s.started = true
 	input := int64(numberField(s.usage, "prompt_tokens"))
-	return s.emit("message_start", map[string]any{
+	if err := s.emit("message_start", map[string]any{
 		"message": map[string]any{
 			"id":            s.msgID,
 			"type":          "message",
@@ -160,7 +239,10 @@ func (s *messagesSink) ensureStarted() error {
 			"stop_sequence": nil,
 			"usage":         map[string]any{"input_tokens": input, "output_tokens": 0},
 		},
-	})
+	}); err != nil {
+		return err
+	}
+	return s.emitSearchPrelude()
 }
 
 // Chunk 处理一帧归一化后的 OpenAI chunk：捕获 usage、处理 content / tool_calls /
@@ -187,6 +269,15 @@ func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 	if delta == nil {
 		return nil
 	}
+	// 上游推理模型的思维链：Anthropic 有对应的 thinking 内容块，映射过去，
+	// 否则 Claude Code / ZCode 这类客户端看不到思考过程（历史误判为「Anthropic
+	// 无 reasoning 块形态」而丢弃）。thinking 块必须排在 text 之前，故在正文
+	// 打开前先消费。
+	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+		if err := s.appendThinking(rc); err != nil {
+			return err
+		}
+	}
 	if txt, ok := delta["content"].(string); ok && txt != "" {
 		if err := s.appendText(txt); err != nil {
 			return err
@@ -203,9 +294,39 @@ func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 			}
 		}
 	}
-	// delta.reasoning_content 显式忽略：Anthropic 无 reasoning 内容块形态，
-	// 本网关无对应数据，不臆造。
+	// delta.reasoning_content 已在上方映射为 thinking 块。
 	return nil
+}
+
+// appendThinking 累积思维链并保证 thinking 块处于打开状态，随后发出 thinking_delta。
+// thinking 块必须排在正文之前，正文块一旦打开就不再接受 thinking（上游实测顺序如此）。
+func (s *messagesSink) appendThinking(txt string) error {
+	if err := s.openThinkingBlock(); err != nil {
+		return err
+	}
+	return s.emit("content_block_delta", map[string]any{
+		"index": s.thinkingIndex,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": txt},
+	})
+}
+
+// openThinkingBlock 保证当前打开的是 thinking 块；若当前打开的是别的块，说明思维链
+// 已结束（正文/tool 已开始），此时忽略后续 thinking，不再新开块。
+func (s *messagesSink) openThinkingBlock() error {
+	if s.open && s.openKind == "thinking" {
+		return nil
+	}
+	if s.open {
+		return nil // 已进入正文/tool 阶段，思维链阶段结束
+	}
+	s.thinkingIndex = s.nextIndex
+	s.nextIndex++
+	s.open = true
+	s.openKind = "thinking"
+	return s.emit("content_block_start", map[string]any{
+		"index":         s.thinkingIndex,
+		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+	})
 }
 
 // appendText 累积正文并保证 text 块处于打开状态，随后发出 text_delta。
@@ -302,10 +423,13 @@ func (s *messagesSink) closeBlock() error {
 		return nil
 	}
 	idx := s.textIndex
-	if s.openKind == "tool" {
+	switch s.openKind {
+	case "tool":
 		if st := s.toolCalls[s.openTool]; st != nil {
 			idx = st.blockIndex
 		}
+	case "thinking":
+		idx = s.thinkingIndex
 	}
 	if err := s.emit("content_block_stop", map[string]any{"index": idx}); err != nil {
 		return err
@@ -380,7 +504,21 @@ func (s *messagesSink) stopReason() string {
 // messagesFromAggregate 把聚合后的 OpenAI chat.completion 转为 Anthropic 消息对象。
 // tool_call.arguments 非法 JSON → 返回错误（不伪造 input）。
 func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]any, error) {
-	content := make([]any, 0, 1)
+	content := make([]any, 0, 3)
+	// web_search 服务端工具：结果块前置在正文之前（与 Anthropic 非流式消息一致）。
+	if ws := meta.webSearch; ws != nil {
+		id := "srvtoolu_" + randHex(16)
+		content = append(content,
+			map[string]any{
+				"type": "server_tool_use", "id": id, "name": "web_search",
+				"input": map[string]any{"query": ws.query},
+			},
+			map[string]any{
+				"type": "web_search_tool_result", "tool_use_id": id,
+				"content": webSearchResultContent(ws),
+			},
+		)
+	}
 	finish := ""
 	if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
 		if cm, ok := choices[0].(map[string]any); ok {
@@ -390,6 +528,12 @@ func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]a
 		}
 	}
 	if message, ok := firstMessage(resp); ok {
+		// 思维链优先于正文（Anthropic 内容块顺序：thinking → text → tool_use）。
+		if rc, ok := message["reasoning_content"].(string); ok && rc != "" {
+			content = append(content, map[string]any{
+				"type": "thinking", "thinking": rc, "signature": "",
+			})
+		}
 		if s, ok := message["content"].(string); ok && s != "" {
 			content = append(content, map[string]any{"type": "text", "text": s})
 		}

@@ -332,6 +332,10 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型别名表（#5）：外部模型名 → 网关目标模型名的精确匹配；nil = 无别名。
 		ModelAliases: cfg.AliasTable,
+		// web_search 服务端工具检索后端（nil = 未启用）。装配期构建，热改需重启。
+		WebSearch:           cfg.WebSearchClient,
+		WebSearchQueryMode:  cfg.WebSearch.QueryMode,
+		WebSearchQueryModel: cfg.WebSearch.QueryModel,
 		// 多 API Key：匹配表（模型白名单 / 出口绑定）+ 逐 Key 台账。
 		KeyTable: cfg.KeyTable,
 		KeyUsage: keyLedger,
@@ -581,6 +585,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// web_search.* 在装配期被 normalizeWebSearch 构建成静态 client，不在 livecfg 热
+	// 快照里——改后端 / key / 代理需重启才生效。
+	out = append(out, "web_search")
 	return out
 }
 

@@ -935,13 +935,51 @@ http://127.0.0.1:7863/panel/
 
 消息块映射：`text`→文本；`image`（`source.type` 为 `base64`/`url`）→`image_url`；assistant 的 `tool_use`→`tool_calls`；user 的 `tool_result`→`role:"tool"` 消息（顺序保持，绝不当成用户文本）。
 
+**无法表达的内容块丢弃而非 400**：`thinking`、`redacted_thinking`、`server_tool_use`、`web_search_tool_result` 及未知 `type`——上游 OpenAI 形态无法表达它们，**丢弃（记 INFO）**。理由：客户端回放的会话历史会带这些块（思考块随每次对话被回传、服务端检索块是本网关自己产出的），逐个 400 会让**旧聊天记录全部无法继续**。丢弃安全：这些块对上游模型不是必需输入（思考块是上一轮过程产物，服务端检索信息已随正文进入历史）。若某条 assistant / mid-conversation `system` 消息的块**全部**被丢弃，整条消息跳过（空消息同样会被上游拒绝）。
+
 **接受但不转发/不生效**：`metadata`（含 `metadata.user_id`）；以及 Anthropic 专有、上游 OpenAI 形态无法表达的 `top_k`、`container`、`mcp_servers`、`context_management`、`service_tier`——**接受但忽略（不 400）**。理由：Claude Code 随 beta 演进会**无条件**带上这些字段（例如开启 effort/thinking 后即带 `context_management`），逐个 400 会让整类功能失效（auto 模式无法判断 Bash 安全性、Bash/Edit 全被拦）。可表达的字段一律映射（见上表 `output_config` / `thinking`），不可表达的忽略。**注意**：`mcp_servers` / `context_management` 承载服务端特性（MCP connector / 上下文编辑），被静默丢弃后客户端收不到错误、功能无声失效——网关对 `mcp_servers` 记 **WARN**（其余忽略字段记 INFO），便于运维侧察觉。
 
-**明确拒绝（400 `invalid_request_error`，命名该字段）**：`max_tokens` 缺失/非正/非整数、未知内容块 `type`、未知 `tool_choice.type`、字段类型错误、`tool_use` 缺 `id`/`name`、`image.source.type` 非法等**形态错误**。
+**明确拒绝（400 `invalid_request_error`，命名该字段）**：`max_tokens` 缺失/非正/非整数、未知 `tool_choice.type`、字段类型错误、`tool_use` 缺 `id`/`name`、`image.source.type` 非法、`tool_result` 内嵌未知块等**形态错误**。
 
 **响应**：非流式返回 Anthropic `message` 对象（`content` 文本 / `tool_use` 块、`stop_reason`、`usage.input_tokens`/`output_tokens`）；流式返回标准事件序列 `message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（可多个块，index 单调）→ `message_delta` → `message_stop`。上游 error 帧映射为 `event: error`。`stop_reason` 映射：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`、`content_filter`→`refusal`、未知/空→`end_turn`；`stop_sequence` 恒为 `null`（上游 OpenAI 形态无法识别命中哪条 stop 序列）。错误信封为 `{"type":"error","error":{"type":"<...>","message":"..."}}`（按 HTTP 状态映射类型；Anthropic 无 `gateway_hint` 字段，网关 hint 折进 `message`）。
 
 > 已知限制：流式 `message_start.usage.input_tokens` 取发出时已观测到的值——上游通常在**末帧**才给 usage，故流式下多为 0，`output_tokens` 以 `message_delta` 的末帧 usage 为准（不伪造）。
+
+### Web 搜索（`web_search` 服务端工具）
+
+Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客户端只渲染结果）。上游 CodeBuddy 无此能力，因此网关自己执行检索，把结果回填成 Anthropic 的 `server_tool_use` + `web_search_tool_result` 内容块，并把结果摘要注入出站 prompt 让模型基于实时结果作答。
+
+**请求侧**：`tools` 里 `type` 形如 `web_search_20250305` / `web_search_20260209` 的条目被识别为服务端工具（**不**转发成 function），`max_uses` / `allowed_domains` / `blocked_domains` 生效。查询串默认用模型把用户问题提炼成搜索查询（`query_mode: "model"`，多一次轻量上游调用，命中率显著优于原始中文问句）；`"raw"` 则直接用最后一条 user 文本。
+
+**响应侧**：流式在 `message_start` 后补发 `content_block_start(server_tool_use)` → `input_json_delta({"query":...})` → `content_block_stop` → `content_block_start(web_search_tool_result)` → `content_block_stop`，正文块索引顺延；非流式把两个块前置到 `content` 之前。检索失败 / 无结果回 `web_search_tool_result_error`（不伪造结果）。
+
+**配置**（`config.json` 的 `web_search` 段，装配期构建、改后需重启）：
+
+```json
+"web_search": {
+  "enabled": true,
+  "backend": "searxng",          // searxng / brave / bing / duckduckgo / tavily
+  "base_url": "http://127.0.0.1:8899",  // searxng
+  "api_key": "",                  // tavily / brave（官方 API）
+  "max_results": 5,
+  "timeout": "12s",
+  "proxy": "",                    // 空 = 用 HTTP(S)_PROXY 环境变量
+  "query_mode": "model",          // model / raw
+  "query_model": ""               // 查询提炼用的模型；空 = 用请求自身模型
+}
+```
+
+**后端选择**（实测，国内直连）：
+
+| backend | 说明 |
+|---|---|
+| `searxng` | **推荐**。自建 SearXNG（`docker run -d -p 127.0.0.1:8899:8080 -v <dir>:/etc/searxng searxng/searxng`），`settings.yml` 里开 `search.formats: [html, json]`。聚合引擎、稳定、无 key。 |
+| `brave` | search.brave.com HTML 抓取，无 key；配 `api_key` 时改走 Brave 官方 API。无 key 时易 429。 |
+| `bing` | Bing RSS（`&format=rss`），无 key；**实测结果质量差**（易返回无关推广），仅兜底。 |
+| `duckduckgo` | html.duckduckgo.com HTML 抓取，无 key；**实测常被 bot 挑战拦截**。 |
+| `tavily` | Tavily API（需 `api_key`）。 |
+
+> 注意：检索**不计入**客户端 usage 记账（属网关侧调用），且 `query_mode: "model"` 会让每次 web_search 请求多消耗一次上游额度。
 
 ### 上游端点
 

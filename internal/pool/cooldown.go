@@ -391,6 +391,45 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	}
 }
 
+// UndoSoftRateCooldown 撤销一次**误记的账号级软冷却**，仅在判定该 429 属网关共享维度
+// （出口 IP/设备指纹）限流、而非该账号超速时调用（server.rateIPGate 激活时的回溯撤销）。
+// 撤销条件从严——仅清「非 6004、无模型豁免、且未过熔断/禁用」的账号级软冷却，避免误伤：
+//   - coolKind != CoolSoft：非软冷却（硬冷却/熔断）不动；
+//   - until 已过期：无冷却可撤；
+//   - 存在非 AuditOnly 的 modelCooldowns：该账号另有真实模型级冷却（6004/11102），
+//     账号级软冷却不是本入口误记的那次，保留；
+//   - disabled/paused：由其他运维状态主导，不动其 until。
+//
+// 撤销时同步回退 softStreak（若因本次误记被推进）与清空 reason/until。返回是否实际撤销。
+func (p *Pool) UndoSoftRateCooldown(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if e.coolKind != CoolSoft || !now.Before(e.until) {
+		return false
+	}
+	if e.disabled || e.paused {
+		return false
+	}
+	for _, mc := range e.modelCooldowns {
+		if !mc.AuditOnly {
+			return false // 另有真实模型级冷却：本次账号级软冷却不属共享维度误记
+		}
+	}
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	if e.softStreak > 0 {
+		e.softStreak--
+	}
+	p.dirty.Store(true)
+	return true
+}
+
 // cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
 // 取较早者）。resetAt 已过期（时钟偏移/文案过期）时时长钳到时间零点附近，立即恢复。
 // 调用方必须已持有 p.mu。
