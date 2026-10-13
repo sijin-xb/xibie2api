@@ -21,8 +21,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -58,6 +60,9 @@ type Config struct {
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
+	// KeyUsage 逐 API Key 台账（nil = key_usage 接口返回 501）。
+	// 当前配置的钥匙列表从 Live 快照的 Keys 读（热生效），不另设字段以免两处漂移。
+	KeyUsage *keyusage.Ledger
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
 
@@ -183,6 +188,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/key_usage", p.withAuth(p.keyUsage))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -790,6 +796,36 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Usage.Save()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// keyUsage 返回逐 API Key 用量台账：窗口内每把钥匙的请求数 / 失败数 / prompt /
+// completion / 合计 token / 积分 / 活跃天 / 最近使用，并与**当前配置对照**——
+// 配了但一次没用过的钥匙也占一行（否则"某把钥匙是不是没人用"无法回答）。
+//
+// days 查询参数：0（缺省）= 全部历史，1 = 今天，7 / 30 等按最近 N 个本地日计。
+// 台账只存密钥指纹，不存密钥原文；此处返回的也只有指纹与备注名。
+func (p *Panel) keyUsage(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.KeyUsage == nil {
+		writeErr(w, http.StatusNotImplemented, "key usage ledger not available")
+		return
+	}
+	days := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("days")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			days = n
+		}
+	}
+	if days > 1440 {
+		days = 1440
+	}
+	// 启用中的钥匙：指纹 → 备注名。Keys 为 nil（未配置 api_keys）时 Entries 返回空。
+	configured := map[string]string{}
+	if p.cfg.Live != nil {
+		for _, e := range p.cfg.Live.Load().Keys.Entries() {
+			configured[apikey.Fingerprint(e.Key)] = e.Name
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.KeyUsage.Snapshot(days, configured))
 }
 
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。

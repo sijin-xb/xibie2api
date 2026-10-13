@@ -62,6 +62,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// assistant.tool_calls」合成一条（部分 agent 客户端回放并行调用的报文形状），是上游
 	// deepseek 系模型 11148 的正面修复；先合并再 repack，repack 才看得到完整的一批调用。
 	if msgs, ok := obj["messages"].([]any); ok {
+		before := SnapshotPairing()
 		msgs, _ = mergeAdjacentToolCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
@@ -69,6 +70,18 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
+		// 观测：本请求实际发生了哪些配对修复。drops 是真实数据丢失（客户端没写回结果），
+		// 走 WARN；merge/repack 是无损归一，会在正常客户端（Codex Desktop 并行调用形状）
+		// 上每轮复现，走 INFO 避免告警疲劳。计数只观测，不改清理行为。
+		if d := diffPairing(before, SnapshotPairing()); d != (PairingCounts{}) {
+			level := "INFO"
+			if d.DroppedCalls > 0 || d.DroppedResults > 0 {
+				level = "WARN"
+			}
+			m, _ := obj["model"].(string)
+			log.Printf("%s: [upstream] tool pairing repaired outbound body: merged_adjacent=%d repacked=%d dropped_tool_calls=%d dropped_tool_results=%d model=%s",
+				level, d.MergedAdjacent, d.Repacked, d.DroppedCalls, d.DroppedResults, m)
+		}
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，

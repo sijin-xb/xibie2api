@@ -868,6 +868,34 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// 限时优惠透出：生效的 promo（factor 0 = 限免）必须写进 /v1/models 条目，
+// 下游据此判"免费"；无促销的模型不得带 promo_* 字段（空值省略，不编造）。
+func TestApplyModelInfoFieldsPromo(t *testing.T) {
+	zero := 0.0
+	entry := applyModelInfoFields(map[string]any{}, upstream.ModelInfo{
+		ID: "cn:step-5-preview", Name: "Step-5-Preview", Credits: "x0.43",
+		PromoFactor: &zero, PromoCredits: "0x", PromoLabel: "独家限免",
+		PromoNote: "10月12日~10月25日，独家官方合作享限时免费体验。",
+	})
+	if got, _ := entry["promo_factor"].(float64); got != 0 {
+		t.Errorf("promo_factor=%v, want 0", entry["promo_factor"])
+	}
+	if entry["promo_credits"] != "0x" || entry["promo_label"] != "独家限免" ||
+		entry["promo_note"] != "10月12日~10月25日，独家官方合作享限时免费体验。" {
+		t.Errorf("promo fields not surfaced: %v", entry)
+	}
+	if entry["credits"] != "x0.43" {
+		t.Errorf("credits (牌价) must be preserved: %v", entry["credits"])
+	}
+
+	plain := applyModelInfoFields(map[string]any{}, upstream.ModelInfo{ID: "cn:glm-5.3", Credits: "x0.06"})
+	for _, k := range []string{"promo_factor", "promo_credits", "promo_label", "promo_note"} {
+		if _, ok := plain[k]; ok {
+			t.Errorf("no-promo model must omit %s", k)
+		}
+	}
+}
+
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()

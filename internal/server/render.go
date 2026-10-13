@@ -47,9 +47,32 @@ func (openAIRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 	h.Set("X-Accel-Buffering", "no")
 	k := newSSEKeepalive(w, sseKeepaliveInterval)
 	defer k.Close()
-	return upstream.StreamHint(k, stats, upstream.FrameHintFunc(hint),
+	return upstream.StreamHint(k, stats, upstream.FrameHintFunc(hint), streamOpts(repair, onErrorFrame)...)
+}
+
+// loopGuardEnabled 输出复读检测开关（features.loop_guard，缺省 true）。
+//
+// 进程级而非每请求：与 chatLogEnabled 同一口径——它是进程配置，不是请求属性。
+// 热生效：main 在配置保存时调 SetLoopGuardEnabled，下一次请求即用新值。
+var loopGuardEnabled = true
+
+// SetLoopGuardEnabled 设置复读检测开关（main 从 config 注入）。
+func SetLoopGuardEnabled(v bool) { loopGuardEnabled = v }
+
+// streamOpts 组装三条协议共用的流式开关：错误帧观察者 + 标记修复 + （开启时）复读检测。
+//
+// 抽成一处是为了让三条协议不会各自漂移——复读检测若漏挂某一条协议，那条协议
+// （例如 Claude Code 走的 /v1/messages）就等于完全不受保护，而这类"只挂了两条"
+// 的漏洞在代码里看不出来。
+func streamOpts(repair *upstream.MarkupRepair, onErrorFrame func(string)) []upstream.StreamOption {
+	opts := []upstream.StreamOption{
 		upstream.WithErrorFrameObserver(onErrorFrame),
-		upstream.WithMarkupRepair(repair))
+		upstream.WithMarkupRepair(repair),
+	}
+	if loopGuardEnabled {
+		opts = append(opts, upstream.WithLoopGuard())
+	}
+	return opts
 }
 
 func (openAIRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) {

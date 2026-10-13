@@ -15,9 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/metrics"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -64,6 +67,18 @@ type Config struct {
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
 
+	// KeyUsage 逐 API Key 台账（可选；nil = 不记录）。与 Usage 同点调用，
+	// 只有请求来自一条显式配置的 api_keys 条目时才落一行（顶层单 key 与
+	// 不鉴权模式指纹为空，不产生台账行）。
+	KeyUsage *keyusage.Ledger
+
+	// KeyTable 多 API Key 匹配表（config api_keys 编译产物）。nil = 未配置，
+	// 鉴权回落 APIKey 单密钥语义——老配置零变化。Live 同时给出时 Live 优先。
+	KeyTable *apikey.Table
+
+	// Version 版本号，仅用于 /metrics 的 build_info 标签。
+	Version string
+
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
@@ -86,6 +101,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 	return livecfg.Snapshot{
 		APIKey:           h.cfg.APIKey,
+		Keys:             h.cfg.KeyTable,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
@@ -146,6 +162,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAuthMessages(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -177,13 +194,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// apiKeyIdentityKey 请求上下文里承载鉴权身份的键。
+type apiKeyIdentityKey struct{}
+
+// authenticate 校验入站请求并返回调用方身份。
+//
+// 两条路径，互斥且口径明确：
+//   - 配了 api_keys（live.Keys != nil）→ 走匹配表，命中返回该条目的模型白名单/域绑定；
+//   - 否则 → 回落顶层单 api_key 的既有语义（空 = 不鉴权），身份为零值（不限制）。
+//
+// 不把两种情形混在一张表里，是为了让"老配置行为逐字节不变"这件事在代码结构上
+// 一眼可见——回落分支就是引入本功能之前的原实现。
+func (h *Handler) authenticate(r *http.Request) (apikey.Identity, bool) {
+	live := h.loadLive()
+	if live.Keys != nil {
+		return live.Keys.Authenticate(r)
+	}
+	if !httpauth.VerifyBearer(r, live.APIKey) {
+		return apikey.Identity{}, false
+	}
+	return apikey.Identity{}, true
+}
+
+// apiKeyIdentityFrom 取出请求上下文里的鉴权身份；未经 withAuth 的路径返回零值
+// （零值身份不限制任何模型/域，因此漏注入不会误拦请求，只会少一层白名单）。
+func apiKeyIdentityFrom(r *http.Request) apikey.Identity {
+	if v, ok := r.Context().Value(apiKeyIdentityKey{}).(apikey.Identity); ok {
+		return v
+	}
+	return apikey.Identity{}
+}
+
+// withAuth 校验 Bearer 密钥，并把命中的身份注入请求上下文供 prepareTurn 做
+// 模型白名单 / 域绑定判定与逐 Key 台账归属。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := h.authenticate(r)
+		if !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), apiKeyIdentityKey{}, id)))
 	}
 }
 
@@ -209,6 +260,78 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"service":        ServiceName,
 		"realm_servable": realmServable,
 	})
+}
+
+// metricsHandler 暴露 Prometheus 文本格式指标（exposition format 0.0.4）。
+//
+// 鉴权与 /status 同口径（Bearer，经 withAuth）：指标含账号总数与逐账号积分，不该
+// 匿名可读；Prometheus 侧用 scrape_config 的 authorization.credentials 传密钥即可。
+//
+// 端点**常驻注册但默认关闭**：metrics.enabled=false 时返回 404（而不是 501），让它
+// 对端口扫描器表现得像一个不存在的路径。开关走 livecfg 快照，因此面板改配置即刻
+// 生效，无需重启。
+//
+// 指标口径刻意与既有观测同源（pool.CountsDetailed / ServableForRealm / reqlog
+// Snapshot / usage Totals），不在本函数里另算一套——否则 /status、面板、/metrics
+// 三处数字迟早对不上，而"哪个数字是真的"是最难查的一类问题。
+func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	if !h.loadLive().MetricsEnabled {
+		http.NotFound(w, r)
+		return
+	}
+
+	snap := metrics.Snapshot{Version: h.cfg.Version}
+	if h.cfg.RequestLog != nil {
+		rs := h.cfg.RequestLog.Snapshot()
+		if !rs.StartedAt.IsZero() {
+			snap.Uptime = time.Since(rs.StartedAt)
+		}
+		snap.RequestsInFlight = rs.InFlight
+		snap.RequestsSucceeded = rs.Succeeded
+		snap.RequestsFailed = rs.Failed
+		snap.RequestAvgSeconds = rs.AvgDurationMs / 1000
+	}
+	if h.cfg.Pool != nil {
+		total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+		snap.AccountsTotal = total
+		snap.AccountsHealthy = healthy
+		snap.AccountsCooling = cooling
+		snap.AccountsDisabled = disabled
+		snap.AccountsInFlight = inFlightFull
+		snap.RealmServable = map[string]bool{
+			"cn":     h.cfg.Pool.ServableForRealm("cn"),
+			"global": h.cfg.Pool.ServableForRealm("global"),
+		}
+		// 逐账号：healthy 口径与 /status 一致（未禁用且未冷却）。
+		for _, st := range h.cfg.Pool.List() {
+			snap.Accounts = append(snap.Accounts, metrics.AccountMetric{
+				UID:     st.UID,
+				Credits: st.Credits,
+				Healthy: !st.Disabled && !st.Cooling,
+				Realm:   st.Realm,
+			})
+		}
+	}
+	if h.cfg.Usage != nil {
+		t := h.cfg.Usage.Totals()
+		snap.TokensPrompt = t.PromptTokens
+		snap.TokensCompletion = t.CompletionTok
+		snap.TokensTotal = t.TotalTokens
+		snap.Credits = t.Credits
+		snap.CacheHitTokens = t.CacheHitTokens
+		snap.CacheMissTokens = t.CacheMissTokens
+	}
+	// 工具调用链路观测：配对管线（upstream 进程级计数）与原生标记还原（server 进程级计数）。
+	pc := upstream.SnapshotPairing()
+	snap.PairingMergedAdjacent = pc.MergedAdjacent
+	snap.PairingRepacked = pc.Repacked
+	snap.PairingDroppedCalls = pc.DroppedCalls
+	snap.PairingDroppedResults = pc.DroppedResults
+	snap.NativeRepairSeen, snap.NativeRepairConverted, snap.NativeRepairRejected = nativeRepairCounts()
+
+	w.Header().Set("Content-Type", metrics.ContentType)
+	// 渲染错误只可能来自 Writer（客户端提前断开），无处可报，忽略即可。
+	_ = metrics.Write(w, snap)
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
@@ -307,8 +430,8 @@ func fmtCreditsPrefix(raw string) string {
 
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
 // 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
-// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
-// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
+// max_allowed_size/reasoning_effort/reasoning_summary/promo_*（限时优惠）。CN
+// 动态分支与 global 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
 // 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
 // 字段（零值）整体省略——不编造。
 func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
@@ -326,6 +449,19 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	}
 	if mi.Credits != "" {
 		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	}
+	// 限时优惠（modelPromotions）：credits 是**牌价**，promo_* 是当前生效折扣
+	//（0 = 限免）。与面板 /panel/api/models 同口径透出——否则下游只看到牌价，
+	// 会把限免模型（如 cn:step-5-preview 牌价 x0.43 / 限免 0x）误判为收费。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
+	}
+	if mi.PromoNote != "" {
+		entry["promo_note"] = mi.PromoNote
 	}
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags
@@ -528,7 +664,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	st, p := h.prepareTurn(r, body, openAIRenderer{})
+	st, p, derr := h.prepareTurn(r, body, openAIRenderer{})
+	if derr != nil {
+		writeOpenAIError(w, derr.status, derr.code, derr.message)
+		return
+	}
 	defer st.done()
 	h.runTurn(r.Context(), w, st, p)
 }

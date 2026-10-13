@@ -31,14 +31,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"strings"
-
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 )
 
 // messagesMeta 承载 Anthropic 响应对象回显所需的原始请求字段（归一化后的 OpenAI
@@ -75,21 +75,26 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		writeMessagesError(w, merr.status, merr.typ, merr.message)
 		return
 	}
-	st, p := h.prepareTurn(r, openAIBody, messagesRenderer{meta: meta})
+	st, p, derr := h.prepareTurn(r, openAIBody, messagesRenderer{meta: meta})
+	if derr != nil {
+		writeMessagesError(w, derr.status, "invalid_request_error", derr.message)
+		return
+	}
 	defer st.done()
 	h.runTurn(r.Context(), w, st, p)
 }
 
-// withAuthMessages 是 /v1/messages 的鉴权包装：复用 httpauth.VerifyBearer 与热改
-// api_key（loadLive），失败时写 **Anthropic** 错误信封（401 authentication_error），
-// 与 OpenAI 路径的 withAuth 互不影响。
+// withAuthMessages 是 /v1/messages 的鉴权包装：复用 h.authenticate（多 API Key
+// 匹配表 + 热改 api_key），失败时写 **Anthropic** 错误信封（401 authentication_error），
+// 与 OpenAI 路径的 withAuth 互不影响。命中身份同样注入上下文，供白名单判定与台账归属。
 func (h *Handler) withAuthMessages(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		id, ok := h.authenticate(r)
+		if !ok {
 			writeMessagesError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), apiKeyIdentityKey{}, id)))
 	}
 }
 
@@ -229,6 +234,28 @@ func normalizeMessagesRequest(raw []byte) ([]byte, messagesMeta, *messagesError)
 	// top_k / container / mcp_servers / context_management / service_tier：Anthropic 专有、
 	// 上游无法表达，**接受但忽略**（不 400）。见文件头「设计纪律」。
 	// metadata（含 metadata.user_id）：接受但忽略（不转发、不回显）。
+	//
+	// 观测：这些字段被静默丢弃，客户端收不到任何错误。mcp_servers 承载服务端 MCP connector，
+	// 丢弃后工具永不执行且无报错——记 WARN 让运维可见；其余（context_management 每请求常带、
+	// top_k/container/service_tier 语义无害）记 INFO，避免告警疲劳。纯观测，不改归一化结果。
+	var warnFields, infoFields []string
+	if v, ok := root["mcp_servers"]; ok && v != nil {
+		warnFields = append(warnFields, "mcp_servers")
+	}
+	for _, f := range []string{"context_management", "top_k", "container", "service_tier"} {
+		if v, ok := root[f]; ok && v != nil {
+			infoFields = append(infoFields, f)
+		}
+	}
+	if len(warnFields) > 0 || len(infoFields) > 0 {
+		level := "INFO"
+		if len(warnFields) > 0 {
+			level = "WARN"
+		}
+		all := append(append([]string{}, warnFields...), infoFields...)
+		log.Printf("%s: [server] messages: Anthropic-specific field(s) accepted but not forwarded (upstream cannot express): %v",
+			level, all)
+	}
 
 	// messages 归一化（tool_use/tool_result/文本/图片块）。
 	oMsgs, merr := normalizeMessagesArray(messagesArr)

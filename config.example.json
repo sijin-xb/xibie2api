@@ -54,7 +54,8 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "loop_guard": true
   },
   "prompt": {
     "mode": "passthrough",
@@ -85,5 +86,17 @@
     "ttl": "30m",
     "gc_interval": "5m"
   },
-  "model_aliases": []
+  "model_aliases": [],
+  "api_keys": [],
+  "metrics": {
+    "enabled": false
+  },
+  "alerting": {
+    "enabled": false,
+    "webhook_url": "",
+    "secret": "",
+    "min_healthy": 1,
+    "cooldown": "30m",
+    "interval": "1m"
+  }
 }

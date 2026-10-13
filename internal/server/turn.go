@@ -35,6 +35,8 @@ type turnParams struct {
 	chatMeta      upstream.ChatMeta // 会话头族
 	degraded      bool              // 初始 degradedApplied
 	renderer      turnRenderer      // 协议相关的响应渲染边界（OpenAI Chat Completions）
+	keyFP         string            // API Key 指纹（空 = 顶层单 key / 未鉴权，不记逐 Key 台账）
+	keyName       string            // API Key 备注名（台账与日志展示用）
 }
 
 // runTurn 执行单轮上游调用：选号 -> 租约 -> 刷新 -> 出站 -> 成功渲染
@@ -340,6 +342,15 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), p.bareModel, kind, logfmt.Truncate(errFrame, 200))
+			case errors.Is(sErr, upstream.ErrLoopDetected):
+				// 输出复读（模型退化）：**不罚号、不轮转**。复读是模型行为而非账号故障，
+				// 同一 body 换个号大概率复现同样的退化，轮转只会把烧钱乘以号数；也不再
+				// 记成功（这一跳没有产出可用结果）。检测点已经中止了上游读取，越早停越省钱。
+				// 与 11101/11115/图片无效同一哲学：请求内容或模型侧问题，不牵连账号健康。
+				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
+				log.Printf("WARN: [server] stream acct=%s model=%s: output loop detected, aborted (account not penalized)",
+					logfmt.Label(acct.UID, acct.Nickname), p.bareModel)
 			case errors.Is(sErr, upstream.ErrSinkWrite):
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
@@ -383,6 +394,7 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(p.bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 			}
+			noteNativeRepair(repair.Seen(), repair.Converted(), repair.Rejected())
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 				// 打一行便于运维确认「这次不再空转」以及统计发生率。
@@ -446,6 +458,7 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 		// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
 		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
 		mrepair := upstream.RepairAggregatedResponse(resp, p.declaredTools, true)
+		noteNativeRepair(mrepair.Seen(), mrepair.Converted(), mrepair.Rejected())
 		if n := mrepair.Converted(); n > 0 {
 			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 				p.bareModel, n, len(p.declaredTools))
@@ -614,28 +627,38 @@ func (h *Handler) recordAttempt(st *chatStat, p *turnParams, uid string, delta p
 	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
 	// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
 	// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
+	//
+	// 逐 Key 台账与用量记录共用同一个 Delta 与同一个 ok 判定：两处各建一份迟早会
+	// 漂移（"用量视图和 Key 台账对不上"是最难查的一类问题），共用是防分叉的唯一办法。
+	ud := usage.Delta{
+		PromptTokens:     delta.PromptTokens,
+		HasPromptTokens:  delta.HasPromptTokens,
+		CompletionTokens: delta.CompletionTokens,
+		HasCompletion:    delta.HasCompletionTokens,
+		TotalTokens:      delta.TotalTokens,
+		HasTotal:         delta.HasTotalTokens,
+		Credit:           credit,
+		HasCredit:        hasCredit,
+		HasCacheTokens:   st.hasCache,
+		CacheHitTokens:   st.cacheHit,
+		CacheMissTokens:  st.cacheMiss,
+		ModelRate:        p.modelRate,
+		LatencyMs:        delta.LatencyMs,
+		HasLatency:       delta.HasLatencyMs,
+		TokensPerSecond:  delta.TokensPerSecond,
+		HasTPS:           delta.HasTokensPerSecond,
+	}
+	attemptOK := delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens
 	if h.cfg.Usage != nil {
 		realm := "cn"
 		if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 			realm = a.Realm
 		}
-		h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
-			PromptTokens:     delta.PromptTokens,
-			HasPromptTokens:  delta.HasPromptTokens,
-			CompletionTokens: delta.CompletionTokens,
-			HasCompletion:    delta.HasCompletionTokens,
-			TotalTokens:      delta.TotalTokens,
-			HasTotal:         delta.HasTotalTokens,
-			Credit:           credit,
-			HasCredit:        hasCredit,
-			HasCacheTokens:   st.hasCache,
-			CacheHitTokens:   st.cacheHit,
-			CacheMissTokens:  st.cacheMiss,
-			ModelRate:        p.modelRate,
-			LatencyMs:        delta.LatencyMs,
-			HasLatency:       delta.HasLatencyMs,
-			TokensPerSecond:  delta.TokensPerSecond,
-			HasTPS:           delta.HasTokensPerSecond,
-		}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+		h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, ud, attemptOK)
+	}
+	// 逐 API Key 台账：仅当请求来自一条显式配置的 api_keys 条目（p.keyFP 非空）时
+	// 落一行。顶层单 key 与不鉴权模式指纹为空，Ledger 内部直接返回，不产生噪音行。
+	if h.cfg.KeyUsage != nil {
+		h.cfg.KeyUsage.Add(time.Now(), p.keyFP, p.keyName, ud, attemptOK)
 	}
 }

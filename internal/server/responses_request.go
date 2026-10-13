@@ -71,7 +71,11 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, rerr.status, rerr.typ, rerr.code, rerr.message, rerr.param, "")
 		return
 	}
-	st, p := h.prepareTurn(r, openAIBody, responsesRenderer{meta: meta})
+	st, p, derr := h.prepareTurn(r, openAIBody, responsesRenderer{meta: meta})
+	if derr != nil {
+		writeResponsesError(w, derr.status, "invalid_request_error", derr.code, derr.message, derr.param, "")
+		return
+	}
 	defer st.done()
 	h.runTurn(r.Context(), w, st, p)
 }

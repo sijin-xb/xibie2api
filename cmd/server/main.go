@@ -17,7 +17,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/keyusage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -234,9 +236,12 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		Keys:                 cfg.KeyTable,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		MetricsEnabled:       cfg.Metrics.Enabled,
+		Alert:                cfg.AlertConfig,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -245,6 +250,17 @@ func main() {
 	rec.Start()
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
+	// 逐 API Key 台账：独立文件（不与 usage.json 混存），只记指纹与备注名。
+	// 未配置 api_keys 时不会有任何行，文件保持不存在。
+	keyUsagePath := stateSibling(cfg.StateFile, "key-usage.json")
+	keyLedger := keyusage.New(keyUsagePath)
+	keyLedger.Start()
+	defer keyLedger.Stop()
+	// 计数用"启用中的条目"而非配置数组长度——禁用条目不算生效的钥匙。
+	if n := len(cfg.KeyTable.Entries()); n > 0 {
+		log.Printf("[keyusage] 多 API Key 已启用：%d 把（台账 %s）", n, keyUsagePath)
+	}
 
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
@@ -265,6 +281,7 @@ func main() {
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
+		KeyUsage:    keyLedger,
 		RequestLog:  requestLog,
 		Upstream:    up,
 		Scheduler:   sch,
@@ -290,6 +307,9 @@ func main() {
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	// 输出复读检测开关（features.loop_guard，缺省开）。进程级配置，启动时注入一次，
+	// 面板保存配置时热更新。
+	server.SetLoopGuardEnabled(cfg.LoopGuardOn)
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -312,11 +332,28 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型别名表（#5）：外部模型名 → 网关目标模型名的精确匹配；nil = 无别名。
 		ModelAliases: cfg.AliasTable,
+		// 多 API Key：匹配表（模型白名单 / 出口绑定）+ 逐 Key 台账。
+		KeyTable: cfg.KeyTable,
+		KeyUsage: keyLedger,
+		// 版本号仅用于 /metrics 的 build_info 标签。
+		Version: appVersion,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	// 可用性阈值告警监控：每轮重新读 livecfg 里的配置（因此面板改阈值/地址/开关
+	// 即刻生效），count 直接问池子要当前口径的数字，不在这里另存一份副本。
+	// **恒启动**（即便启动时关闭）：否则"启动时关闭、之后在面板里打开"将永远不会
+	// 有监控在跑。关闭态下每轮只是读一次配置就返回，代价可忽略。
+	mon := alert.New(server.ServiceName, appVersion,
+		func() alert.Config { return live.Load().Alert },
+		func() (int, int) { t, h, _, _, _ := p.CountsDetailed(); return t, h })
+	if cfg.Alerting.Enabled {
+		log.Printf("[alert] 可用性告警已启用：健康账号 < %d 时推送 %s（冷却 %s，评估间隔 %s）",
+			cfg.Alerting.MinHealthy, cfg.Alerting.WebhookURL, cfg.AlertCooldownDur, cfg.AlertIntervalDur)
+	}
+	go mon.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
@@ -483,11 +520,15 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		Keys:                 newCfg.KeyTable,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		MetricsEnabled:       newCfg.Metrics.Enabled,
+		Alert:                newCfg.AlertConfig,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	server.SetLoopGuardEnabled(newCfg.LoopGuardOn) // 复读检测热生效（下一次请求即用新值）
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

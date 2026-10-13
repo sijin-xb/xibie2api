@@ -11,6 +11,49 @@
 // 的条目让会话自愈，宁可丢一轮工具上下文，也好过整条会话死亡。
 package upstream
 
+import (
+	"strings"
+	"sync/atomic"
+)
+
+// 配对管线观测计数（进程级累加，Prometheus 用；纯观测，不影响合并/重排/清理行为）。
+// 单位：merged_adjacent 为被合并掉的 assistant 消息条数，repacked 为发生重排的批次数，
+// dropped_* 为被剔除的条目数。
+var (
+	pairingMergedAdjacent atomic.Int64
+	pairingRepacked       atomic.Int64
+	pairingDroppedCalls   atomic.Int64
+	pairingDroppedResults atomic.Int64
+)
+
+// PairingCounts 配对管线累计事件快照。
+type PairingCounts struct {
+	MergedAdjacent int64
+	Repacked       int64
+	DroppedCalls   int64
+	DroppedResults int64
+}
+
+// SnapshotPairing 返回配对管线累计计数（metricsHandler 读入 metrics.Snapshot）。纯读。
+func SnapshotPairing() PairingCounts {
+	return PairingCounts{
+		MergedAdjacent: pairingMergedAdjacent.Load(),
+		Repacked:       pairingRepacked.Load(),
+		DroppedCalls:   pairingDroppedCalls.Load(),
+		DroppedResults: pairingDroppedResults.Load(),
+	}
+}
+
+// diffPairing 返回两次快照的增量（payload.go 单次改写观测用）。
+func diffPairing(before, after PairingCounts) PairingCounts {
+	return PairingCounts{
+		MergedAdjacent: after.MergedAdjacent - before.MergedAdjacent,
+		Repacked:       after.Repacked - before.Repacked,
+		DroppedCalls:   after.DroppedCalls - before.DroppedCalls,
+		DroppedResults: after.DroppedResults - before.DroppedResults,
+	}
+}
+
 // repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
 // 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
 //
@@ -36,6 +79,7 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 	}
 	out := make([]any, 0, len(messages))
 	changed := false
+	repacked := 0
 	i := 0
 	for i < len(messages) {
 		m, ok := messages[i].(map[string]any)
@@ -100,9 +144,15 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 		}
 		out = append(out, results...)
 		out = append(out, between...)
+		if len(between) > 0 {
+			repacked++
+		}
 	}
 	if !changed {
 		return messages, false
+	}
+	if repacked > 0 {
+		pairingRepacked.Add(int64(repacked))
 	}
 	return out, true
 }
@@ -124,6 +174,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	}
 	callIDs := map[string]bool{}
 	resultIDs := map[string]bool{}
+	nameBadIDs := map[string]bool{}
 	hasTraffic := false
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
@@ -145,6 +196,9 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 					}
 					if id, ok := tc["id"].(string); ok && id != "" {
 						callIDs[id] = true
+						if toolCallNameEmpty(tc) {
+							nameBadIDs[id] = true
+						}
 						hasTraffic = true
 					}
 				}
@@ -155,13 +209,22 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		return messages, false
 	}
 	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
+	//
+	// 追加否决条件：function.name 为空（含纯空白）的调用一律不保留。上游对这类
+	// 条目直接判 11133 model_param_invalid（tool_calls[i].function.name must be a
+	// non-empty string），且带不带配对结果都会拒——带结果的脏条目原本会命中
+	// keepCalls 原样出站，正是线上 503 的成因。删除动作完全复用两侧对称裁剪。
 	keepCalls := map[string]bool{}
 	for id := range callIDs {
+		if nameBadIDs[id] {
+			continue
+		}
 		if resultIDs[id] {
 			keepCalls[id] = true
 		}
 	}
 	changed := false
+	droppedCalls, droppedResults := 0, 0
 	// 1) assistant.tool_calls：按 keepCalls 对称裁剪——只留有结果的调用，过滤后为空则删键。
 	//
 	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下
@@ -196,6 +259,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 			continue // 整批齐全：零改动
 		}
 		changed = true
+		droppedCalls += len(tcs) - len(keptCalls)
 		if len(keptCalls) == 0 {
 			delete(msg, "tool_calls")
 			continue
@@ -214,6 +278,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 			id, _ := msg["tool_call_id"].(string)
 			if !keepCalls[id] {
 				changed = true
+				droppedResults++
 				continue
 			}
 		}
@@ -221,6 +286,12 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	}
 	if !changed {
 		return messages, false
+	}
+	if droppedCalls > 0 {
+		pairingDroppedCalls.Add(int64(droppedCalls))
+	}
+	if droppedResults > 0 {
+		pairingDroppedResults.Add(int64(droppedResults))
 	}
 	return kept, true
 }
@@ -262,6 +333,7 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 	}
 	out := make([]any, 0, len(messages))
 	changed := false
+	merged := 0
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -278,6 +350,7 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 							prev["tool_calls"] = append(prevCalls, tcs...)
 							mergeReasoningContent(prev, msg)
 							changed = true
+							merged++
 							continue // 本条已并入上一条，不再单独出站
 						}
 					}
@@ -300,6 +373,7 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 								prev["content"] = txt
 								mergeReasoningContent(prev, msg)
 								changed = true
+								merged++
 								continue // 正文已折进上一条
 							}
 						}
@@ -311,6 +385,9 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 	}
 	if !changed {
 		return messages, false
+	}
+	if merged > 0 {
+		pairingMergedAdjacent.Add(int64(merged))
 	}
 	return out, true
 }
@@ -344,4 +421,20 @@ func emptyContent(v any) bool {
 		return len(c) == 0
 	}
 	return false
+}
+
+// toolCallNameEmpty 判断 assistant.tool_calls[] 单项的 function.name 是否为空。
+// 仅当 function 对象存在、name 字段存在且为空白字符串时判真；
+// function / name 字段缺失时判假——历史报文里存在不带 function 的占位条目，
+// 上游不会因此拒参，这里不扩大打击面。
+func toolCallNameEmpty(tc map[string]any) bool {
+	fn, ok := tc["function"].(map[string]any)
+	if !ok {
+		return false
+	}
+	name, ok := fn["name"].(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(name) == ""
 }

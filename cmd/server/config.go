@@ -5,13 +5,17 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 )
@@ -155,7 +159,13 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// LoopGuard 输出复读检测开关。用指针表达"缺省 true"（与 api_keys[].enabled 同法），
+		// 因此老配置无需改动即默认开启；显式 false 可关闭。见 internal/upstream/loopguard.go。
+		LoopGuard *bool `json:"loop_guard,omitempty"`
 	} `json:"features"`
+
+	// LoopGuardOn 解析后的复读检测开关（缺省 true）。
+	LoopGuardOn bool `json:"-"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -221,7 +231,36 @@ type Config struct {
 	// 校验与构建见 normalize（非法配置 fail fast，不静默忽略）。
 	ModelAliases []server.ModelAlias `json:"model_aliases,omitempty"`
 
+	// APIKeys 多 API Key 配置：每把钥匙各自限定可调用的模型（支持 * / ? 通配）
+	// 与出口域（cn / global）。缺省空 = 不启用，鉴权完全回落顶层 api_key 单密钥
+	// 语义（老配置行为零变化）。校验与构建见 normalize（fail fast）。
+	//
+	// 配了 api_keys 之后，顶层 api_key 退居面板/管理接口的后备密钥，不再放行
+	// /v1/*——否则"收窄了钥匙权限"这件事可以被顶层万能钥匙绕过，等于没收窄。
+	APIKeys []apikey.Entry `json:"api_keys,omitempty"`
+
+	// Metrics /metrics 端点（Prometheus 文本格式）。缺省关闭：false 时该路径返回
+	// 404，对端口扫描器表现为不存在。鉴权与 /status 同口径（Bearer）。热生效。
+	Metrics struct {
+		Enabled bool `json:"enabled"`
+	} `json:"metrics"`
+
+	// Alerting 账号池可用性阈值告警：健康账号数跌破 min_healthy 时向 webhook 推
+	// 通知，恢复后再推一条。缺省关闭。webhook_url / secret / 阈值 / 冷却 / 间隔
+	// 全部热生效（监控器每轮重新读取配置）。
+	Alerting struct {
+		Enabled    bool   `json:"enabled"`
+		WebhookURL string `json:"webhook_url"` // 目标地址；enabled=true 时必填
+		Secret     string `json:"secret"`      // HMAC-SHA256 共享密钥；空 = 不签名（仅建议内网）
+		MinHealthy int    `json:"min_healthy"` // 健康账号数下限；缺省 1
+		Cooldown   string `json:"cooldown"`    // 持续故障重复提醒间隔；缺省 "30m"
+		Interval   string `json:"interval"`    // 两次评估最小间隔；缺省 "1m"
+	} `json:"alerting"`
+
 	// 解析后
+	AlertCooldownDur       time.Duration `json:"-"`
+	AlertIntervalDur       time.Duration `json:"-"`
+	AlertConfig            alert.Config  `json:"-"`
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
@@ -238,6 +277,9 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// AliasTable 解析后的别名表（normalize 构建）；nil = 无别名。
 	AliasTable *server.AliasTable `json:"-"`
+	// KeyTable 解析后的多 API Key 匹配表（normalize 构建）；恒非 nil（至少含顶层
+	// api_key 或"不鉴权"语义），因此调用方无需判空。
+	KeyTable *apikey.Table `json:"-"`
 }
 
 // Default 默认配置。
@@ -612,7 +654,90 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.AliasTable = tbl
+	// 多 API Key 匹配表：空 = 未启用（KeyTable 为只含顶层 api_key 的表，行为不变）；
+	// 非空则逐条校验并编译（空密钥 / 重复密钥 / 非法 realm / 密钥含空白或 '*' 均
+	// fail fast——"配了但永远匹配不上"的哑配置比启动失败更难查）。
+	kt, err := apikey.NewTable(c.APIKeys, c.APIKey)
+	if err != nil {
+		return err
+	}
+	c.KeyTable = kt
+	// 输出复读检测：指针为 nil = 未配置 = 缺省开启；显式 false 关闭。
+	c.LoopGuardOn = c.Features.LoopGuard == nil || *c.Features.LoopGuard
+	// 可用性阈值告警：解析时长、校验 webhook 地址，编译成监控器直接吃的 Config。
+	if err := c.normalizeAlerting(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeAlerting 解析并校验 alerting 段。
+//
+// 缺省值：min_healthy=1（0 会让条件"healthy < 0"永假，等于静默失效——所以 0 视为
+// 未填写并回落到 1）、cooldown=30m、interval=1m。
+//
+// 校验 fail fast（与 model_aliases / api_keys 同纪律，不静默忽略）：enabled=true 但
+// webhook_url 为空、URL 不是 http/https、时长非法或非正数，都在启动或面板保存时报错。
+// 理由：告警配错的代价是"故障时没人知道"，而这恰恰是配置错误最难被发现的地方。
+func (c *Config) normalizeAlerting() error {
+	a := &c.Alerting
+	if a.MinHealthy <= 0 {
+		a.MinHealthy = 1
+	}
+	cd, err := parsePositiveDuration("alerting.cooldown", a.Cooldown, 30*time.Minute)
+	if err != nil {
+		return err
+	}
+	iv, err := parsePositiveDuration("alerting.interval", a.Interval, time.Minute)
+	if err != nil {
+		return err
+	}
+	c.AlertCooldownDur = cd
+	c.AlertIntervalDur = iv
+
+	if a.Enabled {
+		u := strings.TrimSpace(a.WebhookURL)
+		if u == "" {
+			return errors.New("alerting.webhook_url 必填（alerting.enabled=true）")
+		}
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return fmt.Errorf("alerting.webhook_url 非法: %w", err)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("alerting.webhook_url 必须是 http/https，got %q", parsed.Scheme)
+		}
+		if parsed.Host == "" {
+			return errors.New("alerting.webhook_url 缺少主机名")
+		}
+		a.WebhookURL = u
+	}
+
+	c.AlertConfig = alert.Config{
+		Enabled:    a.Enabled,
+		WebhookURL: strings.TrimSpace(a.WebhookURL),
+		Secret:     a.Secret,
+		MinHealthy: a.MinHealthy,
+		Cooldown:   cd,
+		Interval:   iv,
+	}
+	return nil
+}
+
+// parsePositiveDuration 解析时长字段：空串用默认值；非法或非正数报错。
+func parsePositiveDuration(field, raw string, def time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s 非法: %w", field, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s 必须为正数，got %s", field, raw)
+	}
+	return d, nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
