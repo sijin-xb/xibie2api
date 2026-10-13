@@ -149,6 +149,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// rateIP 上游 429 共享维度（出口 IP / 设备指纹）限流状态机（fail-fast，
+	// ratelimit.go）：短窗多号命中无恢复时刻的账号级 429 → 跳过逐号软冷却并终止
+	// 轮转。进程内状态、重启清零。
+	rateIP rateIPGate
 }
 
 // NewHandler 构建 handler。
@@ -797,7 +801,9 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
-//     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。无权威恢复
+//     时刻的账号级 429 先过共享维度判定（isSharedDimensionRateLimit）：短窗多号命中
+//     即跳过账号级软冷却（不误罚号），fail-fast 由 runTurn 轮转循环执行。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
@@ -828,6 +834,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 共享维度限流（出口 IP / 设备指纹）先行判定：无权威恢复时刻、非 6004 的
+		// 账号级 429 才有可能是「网关共享出口」被节流而非该账号——这类 429 打在
+		// 当下被选中的账号上，但该账号往往并未超速（实测前 60s 内 0–1 次请求）。
+		// 短窗多号命中即判定共享维度：**跳过账号级软冷却**（不误罚号），由 runTurn
+		// 轮转循环据此 fail-fast 终止轮转（见 isSharedDimensionRateLimit 注释）。
+		if h.isSharedDimensionRateLimit(body, uerr) && h.rateIP.note(uid, h.cfg.Pool.UndoSoftRateCooldown) {
+			return
+		}
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
@@ -917,6 +931,28 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.NoteFailures(uid)
 		}
 	}
+}
+
+// isSharedDimensionRateLimit 报告一次 ErrSoftRate 是否属于「无权威恢复时刻的账号级
+// 429」——只有这类才可能是网关共享维度（出口 IP / 设备指纹）被节流，值得过 rateIP
+// 门判定。排除两类有权威恢复时刻的限流：
+//   - 6004 模型级限流：模型维度，冷却对齐上游重置墙钟、可切模型豁免，非共享维度；
+//   - body 带「将在 … 重置」墙钟或 Retry-After 头：上游已给出该账号/该模型的恢复
+//     时刻，是权威信号，按原语义精确冷却，不参与共享维度判定。
+//
+// 判定与 applyErrorPolicy 的冷却分支严格对齐：仅当「非 6004 且无 resetAt 且无
+// Retry-After」时返回 true——即恰好落在 CooldownSoftRate 有界退避分支的那些 429。
+func (h *Handler) isSharedDimensionRateLimit(body string, uerr *upstream.Error) bool {
+	if upstream.IsModelRateLimit(body) {
+		return false
+	}
+	if _, ok := upstream.ParseRateReset(body); ok {
+		return false
+	}
+	if uerr != nil && uerr.RetryAfter > 0 {
+		return false
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
