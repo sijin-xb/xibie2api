@@ -701,6 +701,11 @@ func TestMessagesStreamTextSequence(t *testing.T) {
 	if md["usage"].(map[string]any)["output_tokens"].(float64) != 5 {
 		t.Fatalf("usage=%v", md["usage"])
 	}
+	// message_delta 必须带 input_tokens（上游末帧才给 prompt_tokens，message_start
+	// 时为 0，客户端靠这里更新上下文占用；缺失会让占用率恒为 0）。
+	if md["usage"].(map[string]any)["input_tokens"].(float64) != 7 {
+		t.Fatalf("message_delta missing input_tokens: %v", md["usage"])
+	}
 }
 
 // TestMessagesStreamThinkingBlock 锁定：上游 delta.reasoning_content → Anthropic

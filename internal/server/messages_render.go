@@ -483,9 +483,10 @@ func (s *messagesSink) Done() error {
 		return err
 	}
 	output := int64(numberField(s.usage, "completion_tokens"))
+	input := int64(numberField(s.usage, "prompt_tokens"))
 	if err := s.emit("message_delta", map[string]any{
 		"delta": map[string]any{"stop_reason": s.stopReason(), "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": output},
+		"usage": map[string]any{"input_tokens": input, "output_tokens": output},
 	}); err != nil {
 		return err
 	}
