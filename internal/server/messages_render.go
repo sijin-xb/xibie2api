@@ -99,10 +99,11 @@ type messagesSink struct {
 
 	nextIndex int
 	open      bool   // 是否有内容块处于打开状态
-	openKind  string // "text" | "tool"
+	openKind  string // "text" | "tool" | "thinking"
 	openTool  int    // openKind=="tool" 时的 OpenAI tool index
 
-	textIndex int // 已打开的 text 块 index（-1 = 无）
+	textIndex     int // 已打开的 text 块 index（-1 = 无）
+	thinkingIndex int // 已打开的 thinking 块 index（-1 = 无）
 
 	toolCalls map[int]*messagesToolCall
 	toolOrder []int
@@ -120,12 +121,13 @@ type messagesSink struct {
 
 func newMessagesSink(w io.Writer, fl http.Flusher, meta messagesMeta) *messagesSink {
 	return &messagesSink{
-		w:         w,
-		fl:        fl,
-		meta:      meta,
-		msgID:     "msg_" + randHex(16),
-		textIndex: -1,
-		toolCalls: map[int]*messagesToolCall{},
+		w:             w,
+		fl:            fl,
+		meta:          meta,
+		msgID:         "msg_" + randHex(16),
+		textIndex:     -1,
+		thinkingIndex: -1,
+		toolCalls:     map[int]*messagesToolCall{},
 	}
 }
 
@@ -267,6 +269,15 @@ func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 	if delta == nil {
 		return nil
 	}
+	// 上游推理模型的思维链：Anthropic 有对应的 thinking 内容块，映射过去，
+	// 否则 Claude Code / ZCode 这类客户端看不到思考过程（历史误判为「Anthropic
+	// 无 reasoning 块形态」而丢弃）。thinking 块必须排在 text 之前，故在正文
+	// 打开前先消费。
+	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+		if err := s.appendThinking(rc); err != nil {
+			return err
+		}
+	}
 	if txt, ok := delta["content"].(string); ok && txt != "" {
 		if err := s.appendText(txt); err != nil {
 			return err
@@ -283,9 +294,39 @@ func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 			}
 		}
 	}
-	// delta.reasoning_content 显式忽略：Anthropic 无 reasoning 内容块形态，
-	// 本网关无对应数据，不臆造。
+	// delta.reasoning_content 已在上方映射为 thinking 块。
 	return nil
+}
+
+// appendThinking 累积思维链并保证 thinking 块处于打开状态，随后发出 thinking_delta。
+// thinking 块必须排在正文之前，正文块一旦打开就不再接受 thinking（上游实测顺序如此）。
+func (s *messagesSink) appendThinking(txt string) error {
+	if err := s.openThinkingBlock(); err != nil {
+		return err
+	}
+	return s.emit("content_block_delta", map[string]any{
+		"index": s.thinkingIndex,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": txt},
+	})
+}
+
+// openThinkingBlock 保证当前打开的是 thinking 块；若当前打开的是别的块，说明思维链
+// 已结束（正文/tool 已开始），此时忽略后续 thinking，不再新开块。
+func (s *messagesSink) openThinkingBlock() error {
+	if s.open && s.openKind == "thinking" {
+		return nil
+	}
+	if s.open {
+		return nil // 已进入正文/tool 阶段，思维链阶段结束
+	}
+	s.thinkingIndex = s.nextIndex
+	s.nextIndex++
+	s.open = true
+	s.openKind = "thinking"
+	return s.emit("content_block_start", map[string]any{
+		"index":         s.thinkingIndex,
+		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+	})
 }
 
 // appendText 累积正文并保证 text 块处于打开状态，随后发出 text_delta。
@@ -382,10 +423,13 @@ func (s *messagesSink) closeBlock() error {
 		return nil
 	}
 	idx := s.textIndex
-	if s.openKind == "tool" {
+	switch s.openKind {
+	case "tool":
 		if st := s.toolCalls[s.openTool]; st != nil {
 			idx = st.blockIndex
 		}
+	case "thinking":
+		idx = s.thinkingIndex
 	}
 	if err := s.emit("content_block_stop", map[string]any{"index": idx}); err != nil {
 		return err
@@ -484,6 +528,12 @@ func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]a
 		}
 	}
 	if message, ok := firstMessage(resp); ok {
+		// 思维链优先于正文（Anthropic 内容块顺序：thinking → text → tool_use）。
+		if rc, ok := message["reasoning_content"].(string); ok && rc != "" {
+			content = append(content, map[string]any{
+				"type": "thinking", "thinking": rc, "signature": "",
+			})
+		}
 		if s, ok := message["content"].(string); ok && s != "" {
 			content = append(content, map[string]any{"type": "text", "text": s})
 		}

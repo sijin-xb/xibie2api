@@ -9,6 +9,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -699,6 +700,93 @@ func TestMessagesStreamTextSequence(t *testing.T) {
 	}
 	if md["usage"].(map[string]any)["output_tokens"].(float64) != 5 {
 		t.Fatalf("usage=%v", md["usage"])
+	}
+}
+
+// TestMessagesStreamThinkingBlock 锁定：上游 delta.reasoning_content → Anthropic
+// thinking 内容块（thinking_delta），且 thinking 块排在 text 块之前（index 0）。
+func TestMessagesStreamThinkingBlock(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, regReasoningSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+
+	// 第一个 content_block_start 必须是 thinking 块，index 0。
+	starts := eventsNamed(events, "content_block_start")
+	if len(starts) < 2 {
+		t.Fatalf("want >=2 content_block_start, got %d (%v)", len(starts), eventNames(events))
+	}
+	cb0 := starts[0].data["content_block"].(map[string]any)
+	if cb0["type"] != "thinking" {
+		t.Fatalf("first block type=%v want thinking", cb0["type"])
+	}
+	if idx := starts[0].data["index"].(float64); idx != 0 {
+		t.Fatalf("thinking index=%v want 0", idx)
+	}
+	// thinking_delta 拼接 == 完整思维链。
+	var think strings.Builder
+	for _, e := range eventsNamed(events, "content_block_delta") {
+		d := e.data["delta"].(map[string]any)
+		if d["type"] == "thinking_delta" {
+			think.WriteString(d["thinking"].(string))
+		}
+	}
+	if think.String() != "先算17乘23" {
+		t.Fatalf("concatenated thinking=%q", think.String())
+	}
+	// 正文仍在，且 text 块 index 晚于 thinking。
+	var text strings.Builder
+	textIdx := -1.0
+	for _, e := range eventsNamed(events, "content_block_delta") {
+		d := e.data["delta"].(map[string]any)
+		if d["type"] == "text_delta" {
+			text.WriteString(d["text"].(string))
+			textIdx = e.data["index"].(float64)
+		}
+	}
+	if text.String() != "391" {
+		t.Fatalf("concatenated text=%q", text.String())
+	}
+	if textIdx <= 0 {
+		t.Fatalf("text index=%v want >0 (after thinking)", textIdx)
+	}
+}
+
+// TestMessagesNonStreamThinkingBlock 锁定：非流式聚合响应里，message.reasoning_content
+// → content 数组首个 thinking 块，后接 text 块。
+func TestMessagesNonStreamThinkingBlock(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, regReasoningSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	content, _ := obj["content"].([]any)
+	if len(content) < 2 {
+		t.Fatalf("content blocks=%v want thinking+text", content)
+	}
+	first, _ := content[0].(map[string]any)
+	if first["type"] != "thinking" || first["thinking"] != "先算17乘23" {
+		t.Fatalf("first block=%v want thinking 先算17乘23", first)
+	}
+	second, _ := content[1].(map[string]any)
+	if second["type"] != "text" || second["text"] != "391" {
+		t.Fatalf("second block=%v want text 391", second)
 	}
 }
 
