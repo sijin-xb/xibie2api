@@ -203,6 +203,9 @@ func (t *Table) Authenticate(r *http.Request) (Identity, bool) {
 	tok := ""
 	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, bearerPrefix) {
 		tok = authz[len(bearerPrefix):]
+	} else if k := r.Header.Get("x-api-key"); k != "" {
+		// Anthropic 客户端（Claude Code / ZCode 的 anthropic provider）用 x-api-key。
+		tok = k
 	}
 	d := digest(tok)
 

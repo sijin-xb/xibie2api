@@ -398,7 +398,6 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 		{"missing_messages", `{"model":"m","max_tokens":10}`, "messages"},
 		{"messages_wrong_type", `{"model":"m","max_tokens":10,"messages":"hi"}`, "messages"},
 		{"stream_wrong_type", `{"model":"m","max_tokens":10,"stream":"yes","messages":[]}`, "stream"},
-		{"unknown_content_block", `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"bogus"}]}]}`, "type"},
 		{"unknown_role", `{"model":"m","max_tokens":10,"messages":[{"role":"tool","content":"x"}]}`, "role"},
 		{"unknown_tool_choice", `{"model":"m","max_tokens":10,"messages":[],"tool_choice":{"type":"weird"}}`, "tool_choice.type"},
 	}
@@ -416,6 +415,83 @@ func TestNormalizeMessagesRequest(t *testing.T) {
 			}
 		})
 	}
+
+	// 客户端回放的会话历史会带 thinking / redacted_thinking / server_tool_use /
+	// web_search_tool_result 等上游无法表达的块；丢弃而非 400，否则旧聊天记录
+	// 全部无法继续（回归：ZCode anthropic provider 回放 thinking 块触发 400）。
+	t.Run("history_thinking_block_dropped", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[` +
+			`{"role":"user","content":"q1"},` +
+			`{"role":"assistant","content":[` +
+			`{"type":"thinking","thinking":"let me think","signature":"sig"},` +
+			`{"type":"text","text":"answer"}]},` +
+			`{"role":"user","content":"q2"}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("thinking block in history must be dropped, not rejected: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		if len(msgs) != 3 {
+			t.Fatalf("messages=%v want 3", msgs)
+		}
+		asst := msgs[1].(map[string]any)
+		if asst["role"] != "assistant" || asst["content"] != "answer" {
+			t.Fatalf("assistant=%v (thinking dropped, text kept)", asst)
+		}
+		if _, ok := asst["tool_calls"]; ok {
+			t.Fatalf("no tool_calls expected: %v", asst)
+		}
+	})
+
+	t.Run("assistant_only_thinking_message_skipped", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[` +
+			`{"role":"user","content":"q1"},` +
+			`{"role":"assistant","content":[{"type":"redacted_thinking","data":"xxxx"}]},` +
+			`{"role":"user","content":"q2"}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("redacted_thinking must be dropped: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		if len(msgs) != 2 {
+			t.Fatalf("all-dropped assistant message must be skipped: %v", msgs)
+		}
+		for _, m := range msgs {
+			if m.(map[string]any)["role"] == "assistant" {
+				t.Fatalf("empty assistant message must not survive: %v", msgs)
+			}
+		}
+	})
+
+	t.Run("history_server_tool_blocks_dropped", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[` +
+			`{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":[` +
+			`{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"x"}},` +
+			`{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://a","title":"t","encrypted_content":""}]},` +
+			`{"type":"text","text":"based on results"}]}` +
+			`]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("server tool blocks must be dropped: %+v", err)
+		}
+		asst := mustDecodeJSON(t, body)["messages"].([]any)[1].(map[string]any)
+		if asst["content"] != "based on results" {
+			t.Fatalf("assistant=%v (server tool blocks dropped, text kept)", asst)
+		}
+	})
+
+	t.Run("unknown_block_type_dropped_not_rejected", func(t *testing.T) {
+		raw := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"bogus"},{"type":"text","text":"hi"}]}]}`
+		body, _, err := normalizeMessagesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unknown block must be dropped, not rejected: %+v", err)
+		}
+		m := mustDecodeJSON(t, body)["messages"].([]any)[0].(map[string]any)
+		if m["content"] != "hi" {
+			t.Fatalf("text must survive alongside dropped block: %v", m)
+		}
+	})
 
 	t.Run("bad_json", func(t *testing.T) {
 		if _, _, err := normalizeMessagesRequest([]byte(`{not json`)); err == nil {

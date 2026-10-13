@@ -17,6 +17,15 @@ func req(key string) *http.Request {
 	return r
 }
 
+// reqXAPIKey 造一个用 Anthropic 风格 x-api-key 承载密钥的请求。
+func reqXAPIKey(key string) *http.Request {
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	if key != "" {
+		r.Header.Set("x-api-key", key)
+	}
+	return r
+}
+
 // ---------------------------------------------------------------- 校验 ----
 
 func TestNewTableValidation(t *testing.T) {
@@ -167,6 +176,13 @@ func TestAuthenticateLegacySingleKey(t *testing.T) {
 	id, _ := tbl.Authenticate(req("legacy-key"))
 	if id.Configured() || id.RealmOverride() != "" || !id.Allows("x", "x") {
 		t.Fatal("顶层单 key 身份应不受限")
+	}
+	// Anthropic 风格的 x-api-key 同口径通过。
+	if _, ok := tbl.Authenticate(reqXAPIKey("legacy-key")); !ok {
+		t.Fatal("x-api-key 正确密钥应通过")
+	}
+	if _, ok := tbl.Authenticate(reqXAPIKey("wrong")); ok {
+		t.Fatal("x-api-key 错误密钥应拒绝")
 	}
 }
 

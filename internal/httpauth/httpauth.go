@@ -15,7 +15,16 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
-// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
+// extractToken 从请求头取出待校验密钥：优先 Authorization: Bearer，
+// 其次 x-api-key（Anthropic 客户端 / Claude Code 的约定）。
+func extractToken(r *http.Request) string {
+	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, bearerPrefix) {
+		return authz[len(bearerPrefix):]
+	}
+	return r.Header.Get("x-api-key")
+}
+
+// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥（或 Anthropic 风格的 x-api-key）。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
 // 比较用 SHA-256 摘要 + subtle.ConstantTimeCompare：
@@ -27,12 +36,12 @@ func VerifyBearer(r *http.Request, key string) bool {
 		return true
 	}
 	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, bearerPrefix) {
+	tok := extractToken(r)
+	if !strings.HasPrefix(authz, bearerPrefix) && tok == "" {
 		// 缺头/方案不对：仍走一次摘要比较，保持耗时形状一致。
 		subtle.ConstantTimeCompare(digest(""), digest(key))
 		return false
 	}
-	tok := authz[len(bearerPrefix):]
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
 }
 

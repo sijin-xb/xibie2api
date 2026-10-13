@@ -79,6 +79,10 @@ type messagesToolCall struct {
 // messagesSink 是 FrameSink 的 Anthropic 实现：拥有事件状态机（message_start 惰性
 // 一次、内容块生命周期、单调 index、per-tool 状态、usage 捕获、终态收尾）。
 //
+// web_search 服务端工具：meta.webSearch 非 nil 时，message_start 之后先补发
+// server_tool_use（携带 query）+ web_search_tool_result 两个内容块，再进入常规
+// 正文/工具块——与 Anthropic 服务端检索的事件序列一致（客户端只渲染，不执行）。
+//
 // 已知限制（诚实记录，不伪造）：
 //   - message_start 的 usage.input_tokens 取「发出时已观测到的 prompt_tokens」。上游
 //     通常在**末帧**才给 usage，因此流式下 input_tokens 多为 0；output_tokens 以
@@ -125,6 +129,79 @@ func newMessagesSink(w io.Writer, fl http.Flusher, meta messagesMeta) *messagesS
 	}
 }
 
+// emitSearchPrelude 在 message_start 之后补发 web_search 服务端工具的事件序列：
+// server_tool_use（input_json_delta 携带 {"query":...}）→ web_search_tool_result。
+// 索引从当前 nextIndex 起单调推进；结束后 open=false，正文块自然从下一个 index 开始。
+func (s *messagesSink) emitSearchPrelude() error {
+	ws := s.meta.webSearch
+	if ws == nil {
+		return nil
+	}
+	id := "srvtoolu_" + randHex(16)
+
+	idx := s.nextIndex
+	s.nextIndex++
+	if err := s.emit("content_block_start", map[string]any{
+		"index": idx,
+		"content_block": map[string]any{
+			"type": "server_tool_use", "id": id, "name": "web_search", "input": map[string]any{},
+		},
+	}); err != nil {
+		return err
+	}
+	partial, _ := json.Marshal(map[string]any{"query": ws.query})
+	if err := s.emit("content_block_delta", map[string]any{
+		"index": idx,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)},
+	}); err != nil {
+		return err
+	}
+	if err := s.emit("content_block_stop", map[string]any{"index": idx}); err != nil {
+		return err
+	}
+
+	ridx := s.nextIndex
+	s.nextIndex++
+	if err := s.emit("content_block_start", map[string]any{
+		"index": ridx,
+		"content_block": map[string]any{
+			"type": "web_search_tool_result", "tool_use_id": id,
+			"content": webSearchResultContent(ws),
+		},
+	}); err != nil {
+		return err
+	}
+	return s.emit("content_block_stop", map[string]any{"index": ridx})
+}
+
+// webSearchResultContent 构造 web_search_tool_result 的 content：
+// 有结果 → 结果数组；失败/空 → web_search_tool_result_error（不伪造结果）。
+func webSearchResultContent(ws *messagesWebSearch) any {
+	if ws.err != "" || len(ws.results) == 0 {
+		code := "unavailable"
+		if ws.err == "" {
+			code = "no_results"
+		}
+		return map[string]any{"type": "web_search_tool_result_error", "error_code": code}
+	}
+	arr := make([]any, 0, len(ws.results))
+	for _, r := range ws.results {
+		item := map[string]any{
+			"type":              "web_search_result",
+			"url":               r.URL,
+			"title":             r.Title,
+			"encrypted_content": "",
+		}
+		if r.PageAge != "" {
+			item["page_age"] = r.PageAge
+		} else {
+			item["page_age"] = nil
+		}
+		arr = append(arr, item)
+	}
+	return arr
+}
+
 // emit 写一条 SSE 事件：event: <name>\ndata: <json>\n\n（data 内附 type），写完 flush。
 func (s *messagesSink) emit(event string, data map[string]any) error {
 	data["type"] = event
@@ -149,7 +226,7 @@ func (s *messagesSink) ensureStarted() error {
 	}
 	s.started = true
 	input := int64(numberField(s.usage, "prompt_tokens"))
-	return s.emit("message_start", map[string]any{
+	if err := s.emit("message_start", map[string]any{
 		"message": map[string]any{
 			"id":            s.msgID,
 			"type":          "message",
@@ -160,7 +237,10 @@ func (s *messagesSink) ensureStarted() error {
 			"stop_sequence": nil,
 			"usage":         map[string]any{"input_tokens": input, "output_tokens": 0},
 		},
-	})
+	}); err != nil {
+		return err
+	}
+	return s.emitSearchPrelude()
 }
 
 // Chunk 处理一帧归一化后的 OpenAI chunk：捕获 usage、处理 content / tool_calls /
@@ -380,7 +460,21 @@ func (s *messagesSink) stopReason() string {
 // messagesFromAggregate 把聚合后的 OpenAI chat.completion 转为 Anthropic 消息对象。
 // tool_call.arguments 非法 JSON → 返回错误（不伪造 input）。
 func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]any, error) {
-	content := make([]any, 0, 1)
+	content := make([]any, 0, 3)
+	// web_search 服务端工具：结果块前置在正文之前（与 Anthropic 非流式消息一致）。
+	if ws := meta.webSearch; ws != nil {
+		id := "srvtoolu_" + randHex(16)
+		content = append(content,
+			map[string]any{
+				"type": "server_tool_use", "id": id, "name": "web_search",
+				"input": map[string]any{"query": ws.query},
+			},
+			map[string]any{
+				"type": "web_search_tool_result", "tool_use_id": id,
+				"content": webSearchResultContent(ws),
+			},
+		)
+	}
 	finish := ""
 	if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
 		if cm, ok := choices[0].(map[string]any); ok {

@@ -18,6 +18,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/apikey"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/websearch"
 )
 
 // Config 顶层配置。
@@ -231,6 +232,29 @@ type Config struct {
 	// 校验与构建见 normalize（非法配置 fail fast，不静默忽略）。
 	ModelAliases []server.ModelAlias `json:"model_aliases,omitempty"`
 
+	// WebSearch web_search 服务端工具的检索后端（仅 /v1/messages 生效）。缺省关闭：
+	// 客户端声明 web_search 时回 web_search_tool_result_error。启用后网关自己执行
+	// 检索（上游 CodeBuddy 无此能力），结果回填成 Anthropic 内容块并注入出站 prompt。
+	//
+	// backend 取值：bing（缺省，无 key，国内直连）/ duckduckgo / searxng / tavily / brave。
+	// 装配期构建 client（改后需重启），见 normalizeWebSearch。
+	WebSearch struct {
+		Enabled    bool   `json:"enabled"`
+		Backend    string `json:"backend"`
+		BaseURL    string `json:"base_url"`    // searxng
+		APIKey     string `json:"api_key"`     // tavily / brave
+		MaxResults int    `json:"max_results"` // 缺省 5
+		Timeout    string `json:"timeout"`     // 缺省 "10s"
+		Proxy      string `json:"proxy"`       // 空 = 用 HTTP(S)_PROXY 环境变量
+		// QueryMode 查询串来源："model"（缺省，用模型提炼查询，多一次轻量上游调用）/
+		// "raw"（直接用最后一条 user 文本，省一次调用但检索命中率较低）。
+		QueryMode string `json:"query_mode"`
+		// QueryModel 查询提炼用的模型（可带 cn:/global: 前缀）；空 = 用请求自身的模型。
+		QueryModel string `json:"query_model"`
+	} `json:"web_search"`
+	// WebSearchClient 解析后的检索客户端（nil = 未启用）。装配期构建一次，热改不生效。
+	WebSearchClient *websearch.Client `json:"-"`
+
 	// APIKeys 多 API Key 配置：每把钥匙各自限定可调用的模型（支持 * / ? 通配）
 	// 与出口域（cn / global）。缺省空 = 不启用，鉴权完全回落顶层 api_key 单密钥
 	// 语义（老配置行为零变化）。校验与构建见 normalize（fail fast）。
@@ -324,6 +348,8 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// web_search 查询串缺省由模型提炼（命中率显著优于原始中文问句）。
+	c.WebSearch.QueryMode = "model"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -668,7 +694,64 @@ func (c *Config) normalize() error {
 	if err := c.normalizeAlerting(); err != nil {
 		return err
 	}
+	if err := c.normalizeWebSearch(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeWebSearch 解析并构建 web_search 检索客户端。
+//
+// 关闭（enabled=false）时 WebSearchClient 保持 nil（/v1/messages 收到 web_search
+// 声明时回 web_search_tool_result_error）。启用时校验后端与必填项（searxng 需
+// base_url；tavily/brave 需 api_key），timeout 解析失败 fail fast。
+func (c *Config) normalizeWebSearch() error {
+	if !c.WebSearch.Enabled {
+		c.WebSearchClient = nil
+		return nil
+	}
+	backend := strings.ToLower(strings.TrimSpace(c.WebSearch.Backend))
+	if backend == "" {
+		backend = "brave"
+	}
+	switch backend {
+	case "brave", "bing", "duckduckgo", "ddg", "searxng", "tavily":
+	default:
+		return fmt.Errorf("web_search.backend: 未知后端 %q（可选 brave / bing / duckduckgo / searxng / tavily）", c.WebSearch.Backend)
+	}
+	if backend == "searxng" && strings.TrimSpace(c.WebSearch.BaseURL) == "" {
+		return fmt.Errorf("web_search.base_url: searxng 后端必填")
+	}
+	if backend == "tavily" && strings.TrimSpace(c.WebSearch.APIKey) == "" {
+		return fmt.Errorf("web_search.api_key: tavily 后端必填")
+	}
+	var timeout time.Duration
+	if s := strings.TrimSpace(c.WebSearch.Timeout); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("web_search.timeout: %w", err)
+		}
+		timeout = d
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.WebSearch.QueryMode))
+	switch mode {
+	case "":
+		mode = "model"
+	case "model", "raw":
+	default:
+		return fmt.Errorf("web_search.query_mode: 未知取值 %q（可选 model / raw）", c.WebSearch.QueryMode)
+	}
+	c.WebSearch.QueryMode = mode
+	c.WebSearchClient = websearch.NewClient(websearch.Config{
+		Enabled:    true,
+		Backend:    backend,
+		BaseURL:    c.WebSearch.BaseURL,
+		APIKey:     c.WebSearch.APIKey,
+		MaxResults: c.WebSearch.MaxResults,
+		Timeout:    timeout,
+		Proxy:      c.WebSearch.Proxy,
+	})
+	return nil
 }
 
 // normalizeAlerting 解析并校验 alerting 段。

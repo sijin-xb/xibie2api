@@ -26,6 +26,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/websearch"
 )
 
 // Config handler 依赖。
@@ -92,6 +93,17 @@ type Config struct {
 	// realm 解析、选号、账号策略、脱敏、提示词改写、出站传输全部沿用既有管线。
 	// 见 alias.go。
 	ModelAliases *AliasTable
+
+	// WebSearch web_search 服务端工具的检索后端（可选；nil = 未启用，客户端声明
+	// web_search 时回 web_search_tool_result_error）。见 messages_websearch.go。
+	WebSearch *websearch.Client
+
+	// WebSearchQueryMode 查询串来源："model"（用模型把用户问题提炼成搜索查询，
+	// 多一次轻量上游调用）/"raw"（直接用最后一条 user 文本）。空值按 "model"。
+	WebSearchQueryMode string
+
+	// WebSearchQueryModel 查询提炼用的模型（可带 realm 前缀）；空 = 用请求自身的模型。
+	WebSearchQueryModel string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。

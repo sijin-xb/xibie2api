@@ -50,6 +50,20 @@ func TestVerifyBearerWithoutHeaderStillCompares(t *testing.T) {
 	}
 }
 
+// TestVerifyXAPIKey Anthropic 客户端用 x-api-key 承载密钥，须与 Bearer 同口径。
+func TestVerifyXAPIKey(t *testing.T) {
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	r.Header.Set("x-api-key", "sk-abc123")
+	if !VerifyBearer(r, "sk-abc123") {
+		t.Error("x-api-key 正确密钥应通过")
+	}
+	r2 := httptest.NewRequest("POST", "/v1/messages", nil)
+	r2.Header.Set("x-api-key", "sk-wrong")
+	if VerifyBearer(r2, "sk-abc123") {
+		t.Error("x-api-key 错误密钥应拒绝")
+	}
+}
+
 func TestDigestIsFixedLength(t *testing.T) {
 	// 不同长度输入摘要后应等长（这是常量时间比较的前提）
 	if len(digest("")) != len(digest("a-much-longer-secret-value")) {
