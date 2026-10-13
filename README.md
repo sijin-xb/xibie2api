@@ -503,6 +503,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `workbuddy_usage_tokens_total{kind}` | counter | `prompt` / `completion` / `total` |
 | `workbuddy_usage_credits_total` | counter | 上游 `usage.credit` 累计扣除 |
 | `workbuddy_cache_tokens_total{result}` | counter | 前缀缓存 `hit` / `miss` |
+| `workbuddy_tool_pairing_events_total{direction}` | counter | 出站工具配对自愈事件：`merged_adjacent` / `repacked` / `dropped_tool_call` / `dropped_tool_result`（`dropped_*` = 客户端坏历史被剔除的条目数，真实数据丢失） |
+| `workbuddy_native_tool_repair_total{result}` | counter | 原生工具调用标记还原：`seen`（识别到的标记块）/ `converted`（还原出的调用）/ `rejected`（识别到但未还原——残留风险面，建议单独告警） |
 
 指标口径刻意与既有观测**同源**（`pool.CountsDetailed` / `ServableForRealm` / `reqlog.Snapshot` / `usage.Totals`），不在渲染层另算一套——否则 `/status`、面板、`/metrics` 三处数字迟早对不上，而「哪个数字是真的」是最难查的一类问题。
 
@@ -906,12 +908,14 @@ http://127.0.0.1:7863/panel/
 | `stop_sequences` | → OpenAI `stop` |
 | `tools` | `{name,description,input_schema}` → `{type:"function",function:{...}}` |
 | `tool_choice` | `{type:"auto"}`→`auto`；`{type:"any"}`→`required`；`{type:"none"}`→`none`；`{type:"tool",name}`→`{type:"function",function:{name}}` |
+| `output_config.effort` | → 出站 `reasoning_effort`（走既有档位降级管线）；`output_config.format` 等其余键忽略 |
+| `thinking.type` | `enabled`/`disabled` → 出站 `thinking.type`；`budget_tokens` 忽略（档位由 `reasoning_effort` 表达） |
 
 消息块映射：`text`→文本；`image`（`source.type` 为 `base64`/`url`）→`image_url`；assistant 的 `tool_use`→`tool_calls`；user 的 `tool_result`→`role:"tool"` 消息（顺序保持，绝不当成用户文本）。
 
-**接受但不转发**：`metadata`（含 `metadata.user_id`）——接受并忽略。
+**接受但不转发/不生效**：`metadata`（含 `metadata.user_id`）；以及 Anthropic 专有、上游 OpenAI 形态无法表达的 `top_k`、`container`、`mcp_servers`、`context_management`、`service_tier`——**接受但忽略（不 400）**。理由：Claude Code 随 beta 演进会**无条件**带上这些字段（例如开启 effort/thinking 后即带 `context_management`），逐个 400 会让整类功能失效（auto 模式无法判断 Bash 安全性、Bash/Edit 全被拦）。可表达的字段一律映射（见上表 `output_config` / `thinking`），不可表达的忽略。**注意**：`mcp_servers` / `context_management` 承载服务端特性（MCP connector / 上下文编辑），被静默丢弃后客户端收不到错误、功能无声失效——网关对 `mcp_servers` 记 **WARN**（其余忽略字段记 INFO），便于运维侧察觉。
 
-**明确拒绝（400 `invalid_request_error`，命名该字段）**：`top_k`、`thinking`、`output_config`、`container`、`mcp_servers`、`context_management`、`service_tier`、未知内容块 `type`、未知 `tool_choice.type`、字段类型错误。这些字段会改变生成语义而上游 OpenAI 形态无法表达——网关无状态，拒绝而非静默丢弃。
+**明确拒绝（400 `invalid_request_error`，命名该字段）**：`max_tokens` 缺失/非正/非整数、未知内容块 `type`、未知 `tool_choice.type`、字段类型错误、`tool_use` 缺 `id`/`name`、`image.source.type` 非法等**形态错误**。
 
 **响应**：非流式返回 Anthropic `message` 对象（`content` 文本 / `tool_use` 块、`stop_reason`、`usage.input_tokens`/`output_tokens`）；流式返回标准事件序列 `message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（可多个块，index 单调）→ `message_delta` → `message_stop`。上游 error 帧映射为 `event: error`。`stop_reason` 映射：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`、`content_filter`→`refusal`、未知/空→`end_turn`；`stop_sequence` 恒为 `null`（上游 OpenAI 形态无法识别命中哪条 stop 序列）。错误信封为 `{"type":"error","error":{"type":"<...>","message":"..."}}`（按 HTTP 状态映射类型；Anthropic 无 `gateway_hint` 字段，网关 hint 折进 `message`）。
 

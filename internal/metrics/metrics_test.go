@@ -166,3 +166,34 @@ func TestHelpTypeOncePerFamily(t *testing.T) {
 		t.Errorf("逐账号族应各只有一条 HELP: %v", helps)
 	}
 }
+
+// TestToolChainObservabilitySeries 锁定工具调用链路的观测族：配对管线四向 +
+// 原生标记还原三态必须渲染，且同族共用恰好一条 HELP/TYPE（严格解析器要求）。
+func TestToolChainObservabilitySeries(t *testing.T) {
+	out := render(t, Snapshot{
+		PairingMergedAdjacent: 3,
+		PairingRepacked:       2,
+		PairingDroppedCalls:   1,
+		PairingDroppedResults: 1,
+		NativeRepairSeen:      10,
+		NativeRepairConverted: 8,
+		NativeRepairRejected:  2,
+	})
+	hasLine(t, out, `workbuddy_tool_pairing_events_total{direction="merged_adjacent"} 3`)
+	hasLine(t, out, `workbuddy_tool_pairing_events_total{direction="repacked"} 2`)
+	hasLine(t, out, `workbuddy_tool_pairing_events_total{direction="dropped_tool_call"} 1`)
+	hasLine(t, out, `workbuddy_tool_pairing_events_total{direction="dropped_tool_result"} 1`)
+	hasLine(t, out, `workbuddy_native_tool_repair_total{result="seen"} 10`)
+	hasLine(t, out, `workbuddy_native_tool_repair_total{result="converted"} 8`)
+	hasLine(t, out, `workbuddy_native_tool_repair_total{result="rejected"} 2`)
+
+	helps := map[string]int{}
+	for _, line := range strings.Split(out, "\n") {
+		if name, ok := strings.CutPrefix(line, "# HELP "); ok {
+			helps[strings.Fields(name)[0]]++
+		}
+	}
+	if helps["workbuddy_tool_pairing_events_total"] != 1 || helps["workbuddy_native_tool_repair_total"] != 1 {
+		t.Errorf("工具链路观测族应各只有一条 HELP: %v", helps)
+	}
+}

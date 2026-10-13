@@ -513,3 +513,47 @@ func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
 		assertSummary(t, summarize(out), []string{"assistant(c1,c2)", "tool(c1)", "tool(c2)"})
 	})
 }
+
+// TestPairingCounters 锁定配对管线的观测计数：merge/repack/drop 各自累加。
+// 计数器是进程级全局，故用前后增量断言（绝对值会被同包其它测试污染）。
+// 计数只观测、不影响返回结果——行为由上面各用例钉桩。
+func TestPairingCounters(t *testing.T) {
+	before := SnapshotPairing()
+
+	// merge：背靠背两条 assistant.tool_calls 合成一条（并入 1 条）。
+	mergeAdjacentToolCalls(msgs(t, `[
+		{"role":"assistant","content":null,"tool_calls":[{"id":"c00","type":"function","function":{"name":"a","arguments":"{}"}}]},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"c01","type":"function","function":{"name":"b","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c00","content":"x"},
+		{"role":"tool","tool_call_id":"c01","content":"y"}
+	]`))
+
+	// repack：非 tool 消息插在同批结果中间（重排 1 批）。
+	repackToolResultBlocks(msgs(t, `[
+		{"role":"assistant","tool_calls":[{"id":"c00"},{"id":"c01"}]},
+		{"role":"tool","tool_call_id":"c00","content":"x"},
+		{"role":"developer","content":"notice"},
+		{"role":"tool","tool_call_id":"c01","content":"y"}
+	]`))
+
+	// cleanup：c09 无结果（丢 1 个调用）+ c88 无调用（丢 1 个结果）。
+	cleanupOrphanToolCalls(msgs(t, `[
+		{"role":"assistant","tool_calls":[{"id":"c00","type":"function","function":{"name":"a"}},{"id":"c09","type":"function","function":{"name":"z"}}]},
+		{"role":"tool","tool_call_id":"c00","content":"x"},
+		{"role":"tool","tool_call_id":"c88","content":"orphan"}
+	]`))
+
+	d := diffPairing(before, SnapshotPairing())
+	if d.MergedAdjacent != 1 {
+		t.Errorf("merged_adjacent=%d, want 1", d.MergedAdjacent)
+	}
+	if d.Repacked != 1 {
+		t.Errorf("repacked=%d, want 1", d.Repacked)
+	}
+	if d.DroppedCalls != 1 {
+		t.Errorf("dropped_tool_calls=%d, want 1", d.DroppedCalls)
+	}
+	if d.DroppedResults != 1 {
+		t.Errorf("dropped_tool_results=%d, want 1", d.DroppedResults)
+	}
+}

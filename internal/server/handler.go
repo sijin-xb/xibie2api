@@ -321,6 +321,13 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		snap.CacheHitTokens = t.CacheHitTokens
 		snap.CacheMissTokens = t.CacheMissTokens
 	}
+	// 工具调用链路观测：配对管线（upstream 进程级计数）与原生标记还原（server 进程级计数）。
+	pc := upstream.SnapshotPairing()
+	snap.PairingMergedAdjacent = pc.MergedAdjacent
+	snap.PairingRepacked = pc.Repacked
+	snap.PairingDroppedCalls = pc.DroppedCalls
+	snap.PairingDroppedResults = pc.DroppedResults
+	snap.NativeRepairSeen, snap.NativeRepairConverted, snap.NativeRepairRejected = nativeRepairCounts()
 
 	w.Header().Set("Content-Type", metrics.ContentType)
 	// 渲染错误只可能来自 Writer（客户端提前断开），无处可报，忽略即可。
@@ -423,8 +430,8 @@ func fmtCreditsPrefix(raw string) string {
 
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
 // 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
-// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
-// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
+// max_allowed_size/reasoning_effort/reasoning_summary/promo_*（限时优惠）。CN
+// 动态分支与 global 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
 // 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
 // 字段（零值）整体省略——不编造。
 func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
@@ -442,6 +449,19 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	}
 	if mi.Credits != "" {
 		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	}
+	// 限时优惠（modelPromotions）：credits 是**牌价**，promo_* 是当前生效折扣
+	//（0 = 限免）。与面板 /panel/api/models 同口径透出——否则下游只看到牌价，
+	// 会把限免模型（如 cn:step-5-preview 牌价 x0.43 / 限免 0x）误判为收费。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
+	}
+	if mi.PromoNote != "" {
+		entry["promo_note"] = mi.PromoNote
 	}
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags

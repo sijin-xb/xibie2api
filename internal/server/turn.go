@@ -394,6 +394,7 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(p.bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 			}
+			noteNativeRepair(repair.Seen(), repair.Converted(), repair.Rejected())
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 				// 打一行便于运维确认「这次不再空转」以及统计发生率。
@@ -457,6 +458,7 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 		// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
 		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
 		mrepair := upstream.RepairAggregatedResponse(resp, p.declaredTools, true)
+		noteNativeRepair(mrepair.Seen(), mrepair.Converted(), mrepair.Rejected())
 		if n := mrepair.Converted(); n > 0 {
 			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 				p.bareModel, n, len(p.declaredTools))

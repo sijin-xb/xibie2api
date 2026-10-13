@@ -29,6 +29,34 @@ const maxUserAgentLen = 200
 // chatSeq 进程级请求序号。
 var chatSeq atomic.Int64
 
+// 原生工具调用标记还原的进程级累计（Prometheus 用）。语义见 upstream/dsml.go：
+// Seen=识别到的标记块数（含被拒），Converted=还原出的调用数，Rejected=识别到但未还原
+// 的块数。Rejected 即「拿不准原文透出」的残留风险面，供 /metrics 单独观察（此前只有
+// stdout WARN，无法做阈值告警）。
+var (
+	nativeRepairSeen      atomic.Int64
+	nativeRepairConverted atomic.Int64
+	nativeRepairRejected  atomic.Int64
+)
+
+// noteNativeRepair 累计一次标记还原观测（纯观测，不影响还原行为）。
+func noteNativeRepair(seen, converted, rejected int) {
+	if seen > 0 {
+		nativeRepairSeen.Add(int64(seen))
+	}
+	if converted > 0 {
+		nativeRepairConverted.Add(int64(converted))
+	}
+	if rejected > 0 {
+		nativeRepairRejected.Add(int64(rejected))
+	}
+}
+
+// nativeRepairCounts 返回累计值（metricsHandler 读入 metrics.Snapshot）。
+func nativeRepairCounts() (seen, converted, rejected int64) {
+	return nativeRepairSeen.Load(), nativeRepairConverted.Load(), nativeRepairRejected.Load()
+}
+
 // chatLogEnabled 聊天表格日志总开关。生产恒 true；
 // 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
 var chatLogEnabled = true

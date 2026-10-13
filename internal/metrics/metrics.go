@@ -54,6 +54,18 @@ type Snapshot struct {
 	Credits          float64
 	CacheHitTokens   int64
 	CacheMissTokens  int64
+
+	// 工具调用链路观测（加法式，仅观测，不影响行为）。
+	// 配对管线：客户端坏历史的自愈动作计数（见 upstream/tool_pairing.go）。
+	PairingMergedAdjacent int64
+	PairingRepacked       int64
+	PairingDroppedCalls   int64
+	PairingDroppedResults int64
+	// 原生工具调用标记还原：Seen=识别到的标记块数，Converted=还原出的调用数，
+	// Rejected=识别到但未还原的块数（见 upstream/dsml.go）。
+	NativeRepairSeen      int64
+	NativeRepairConverted int64
+	NativeRepairRejected  int64
 }
 
 // Write 把快照写成 Prometheus 文本格式。任何错误都来自底层 Writer。
@@ -127,6 +139,33 @@ func Write(w io.Writer, s Snapshot) error {
 		[]label{{"result", "hit"}}, float64(s.CacheHitTokens))
 	e.counter("workbuddy_cache_tokens_total", "Prefix-cache tokens by result.",
 		[]label{{"result", "miss"}}, float64(s.CacheMissTokens))
+
+	// 工具调用配对管线事件（客户端坏历史自愈）：direction 固定 4 值，基数可控。
+	// 无 model 标签——模型维度基数不可控（上游模型名任意），细节留在 WARN 日志里。
+	e.counter("workbuddy_tool_pairing_events_total",
+		"Tool-call pairing pipeline events by direction (client history repair).",
+		[]label{{"direction", "merged_adjacent"}}, float64(s.PairingMergedAdjacent))
+	e.counter("workbuddy_tool_pairing_events_total",
+		"Tool-call pairing pipeline events by direction (client history repair).",
+		[]label{{"direction", "repacked"}}, float64(s.PairingRepacked))
+	e.counter("workbuddy_tool_pairing_events_total",
+		"Tool-call pairing pipeline events by direction (client history repair).",
+		[]label{{"direction", "dropped_tool_call"}}, float64(s.PairingDroppedCalls))
+	e.counter("workbuddy_tool_pairing_events_total",
+		"Tool-call pairing pipeline events by direction (client history repair).",
+		[]label{{"direction", "dropped_tool_result"}}, float64(s.PairingDroppedResults))
+
+	// 原生工具调用标记还原（DSML 文本 → 结构化 tool_calls）：result 固定 3 值。
+	// rejected 是「识别到标记却没还原」的残留风险面，单独看这条。
+	e.counter("workbuddy_native_tool_repair_total",
+		"Native tool-call markup repair outcomes (DSML text -> structured tool_calls).",
+		[]label{{"result", "seen"}}, float64(s.NativeRepairSeen))
+	e.counter("workbuddy_native_tool_repair_total",
+		"Native tool-call markup repair outcomes (DSML text -> structured tool_calls).",
+		[]label{{"result", "converted"}}, float64(s.NativeRepairConverted))
+	e.counter("workbuddy_native_tool_repair_total",
+		"Native tool-call markup repair outcomes (DSML text -> structured tool_calls).",
+		[]label{{"result", "rejected"}}, float64(s.NativeRepairRejected))
 
 	_, err := io.WriteString(w, e.render())
 	return err
