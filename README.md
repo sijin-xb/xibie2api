@@ -546,6 +546,28 @@ assert hmac.compare_digest("sha256=" + mac, request.headers["X-Signature"])
 # 再校验 X-Timestamp 与 body["timestamp"] 一致且时间新鲜，防旧报文重放
 ```
 
+**工具调用链路告警（Prometheus 示例）** — `workbuddy_tool_pairing_events_total` 与 `workbuddy_native_tool_repair_total` 刻画「客户端坏历史被自愈」与「原生标记还原失败」，是**静默数据丢失 / 功能失效**的可观测面。网关内置 `alerting`（上面的 webhook）只管账号可用性，不管这些——需要在 Prometheus 侧加规则：
+
+```yaml
+groups:
+  - name: workbuddy-toolchain
+    rules:
+      # 原生标记识别到却没还原：Codex 会把标记当正文，回合空转（残留风险面）
+      - alert: WorkbuddyNativeToolRepairRejected
+        expr: increase(workbuddy_native_tool_repair_total{result="rejected"}[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "原生工具调用标记识别到但未还原（5m 内 {{ $value }} 次），检查 dsml 判定与上游输出形态"
+      # 配对清理剔除了无法配对的条目 = 真实数据丢失（客户端没写回工具结果）
+      - alert: WorkbuddyToolPairingDropped
+        expr: increase(workbuddy_tool_pairing_events_total{direction=~"dropped_.*"}[5m]) > 0
+        labels: { severity: info }
+        annotations:
+          summary: "出站工具配对清理剔除了 {{ $value }} 个条目（客户端坏历史），该会话上下文有损"
+```
+
+> `merged_adjacent` / `repacked` 是**无损归一**，正常客户端（Codex Desktop 并行调用形状）上会持续出现，**不建议告警**——只在排查工具调用异常时观察。
+
 ### 输出复读检测（`features.loop_guard`）
 
 推理模型偶发退化时会陷入复读：同一句话或同一段「行动短句」被无限重复，直到撞上上游输出上限或空闲超时。**这不是报错**——上游一路 200 正常吐帧，网关既有的降级重试（`content_blocked`）与熔断都拦不住它，而**积分按 token 实扣**。一个号陷入循环就是一路静默烧钱。
