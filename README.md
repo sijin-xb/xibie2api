@@ -1,80 +1,89 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
+  <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="xibie2api" width="120">
 </p>
 
-<h1 align="center">WorkBuddy2API Panel</h1>
+<h1 align="center">xibie2api</h1>
 
 <p align="center">
-  <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+  <b>把腾讯 CodeBuddy 账号变成 OpenAI / Anthropic 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
+  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · Chat Completions / Responses / Anthropic Messages 三协议 · 流式 / 非流式
 </p>
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.22.5-00ADD8?logo=go&logoColor=white&style=flat-square">
-  <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
+  <img alt="API" src="https://img.shields.io/badge/API-OpenAI%20%2F%20Anthropic-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
+  <img alt="CI" src="https://github.com/sijin-xb/xibie2api/actions/workflows/ci.yml/badge.svg">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
 ---
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
-> 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
+> **fork 溯源链**：`Sliverkiss/workbuddy2api`（原版，2026-09 删库）→ `linguo2625469/workbuddy2api-panel`（面板分支）→ **`sijin-xb/xibie2api`（本项目）**。
+> 本项目 `origin` 指向自身，`upstream` remote 指向 `linguo2625469/workbuddy2api-panel`；`main` 领先上游 34 个提交、落后 0。上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，本 fork 的增量概览见 [与上游的差异](#-与上游的差异)。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
 
-## 使用声明（必读）
+## 定位与特性
 
-本项目（含上游 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，下同）的开发初衷只有一个：**方便个人管理自己的 CodeBuddy 账号**——自动签到、保活、给自己的本地工具提供一个 OpenAI 兼容入口。它是免费、开源、按「原样」提供的个人自用工具。
+xibie2api 是一个自托管的 **OpenAI / Anthropic 兼容反向代理网关**，把腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions`、`/v1/responses` 与 Anthropic Messages 子集 `/v1/messages` 服务，并附带一个内嵌的 Web 管理面板。
 
-近期我们发现有人将本项目用于以下行为：
-
-- **批量注册小号 / 收购账号，对外提供付费 API、共享池、代充等业务**；
-- **二次加壳、捆绑卡密（授权码）售卖**，或以「公益服」「低价中转」等名义变相收费分发。
-
-我们对上述行为**表达最强烈的反对**，并声明如下：
-
-1. **一切商用 / 售卖行为与本项目及作者无关。** 本项目不授权、不支持、不参与任何面向公众的 API 售卖、账号池出租、卡密收费分发；行为人由此产生的一切后果（包括但不限于账号封禁、条款违约与法律风险）由其自行承担，与作者和贡献者无任何关系。
-2. **批量注册与转售接口配额违反目标平台服务条款。** CodeBuddy / 腾讯系服务条款禁止批量注册账号及商业转售接口。上游仓库已删除、停止公开维护——我们无法断定具体原因，但此类滥用行为正在毁掉所有正常使用者的环境，请勿再消耗社区的善意。
-3. **请勿购买任何「收费版」「卡密版」「公益中转版」。** 本项目永远免费开源。任何加壳、加密、捆绑收费的「版本」都是他人篡改的产物，与本项目无关；且此类分发无法审计，存在被植入后门、回传并窃取你 CodeBuddy 凭证的风险（`auths/` 中保存的是明文 accessToken / refreshToken）。**你付钱买到的不是本项目，而是把自己账号交给陌生人的机会。**
-4. **关于开源协议的诚实说明。** 本项目基于 MIT 协议开源，协议允许自由使用与修改源码——这是开源的本意，我们不会收回；但 MIT 赋予的是代码层面的自由，**不赋予**以本项目名义宣传、售卖、捆绑分发，或要求作者提供支持与背书的权利。作者不为任何第三方分发版本提供支持、更新承诺或安全保证。
-5. **作者保留止损的权利。** 若滥用行为持续，作者可能随时停止维护、关闭或删除仓库，且不另行通知。上游的今天可能就是本项目的明天，望自重。
-
-如果你的用途是管理自己的账号，欢迎正常使用、反馈问题与提交 PR。
-
-## 项目简介
-
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions`、`/v1/responses` 与 Anthropic Messages 子集 `/v1/messages` 服务。
-
-- 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
-- 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
-- 对客户端暴露 OpenAI 兼容接口（`/v1/chat/completions`、`/v1/responses`）与 Anthropic Messages 子集（`/v1/messages`），现有 SDK / 前端 / 工具 **零改造接入**。
+- 官方不提供 OpenAI 形态的开放 API。本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理。
+- 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号。
+- 对客户端暴露三套协议，现有 OpenAI / Anthropic SDK、CLI（Codex、Claude Code、ZCode 等）与前端工具 **零改造接入**。
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
-## 核心能力
+### 核心能力
 
 | 能力 | 说明 |
 |---|---|
-| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
+| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号；面板「添加账号」免命令行、热加载进池 |
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
-| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
+| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流、429 共享维度限流 fail-fast |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
-| ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
-| ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
-| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
-| 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
+| 🔌 **三协议适配** | `/v1/chat/completions`（OpenAI Chat）、`/v1/responses`（OpenAI Responses / Codex）、`/v1/messages`（Anthropic Messages / Claude Code）共用同一条 `runTurn` 执行管线 |
+| 🗝️ **多 API Key** | `api_keys`：每把钥匙限定可调用模型（`*` / `?` 通配）与出口域（cn/global），越权本地 400；逐 Key 用量台账 |
+| 🧠 **模型别名** | `model_aliases`：把 `claude-sonnet-4-5` / `gpt-5` 等外部模型名精确映射到网关支持的模型 |
+| ⏰ **定时任务** | 签到（09/21 点，末尾自动跑连登管家）+ 活跃上报（10 点）+ 猫猫旅行（09/21 点）+ token 保活（22 点）+ 夜猫子（23 点）+ 成长任务队列（01 点），六类独立开关 |
+| ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；SSE 注释心跳防长推理回合被空闲超时腰斩；非流式本地聚合为单响应 |
+| 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级；Anthropic `thinking` 块映射 |
+| 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `passthrough`），从源头消灭 system 来源的内容误报；遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
-| 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
+| 🛡️ **输出复读检测** | `features.loop_guard`：流尾完全周期性即中止该次上游读取，防止推理退化静默烧钱 |
+| 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 身份标识；Prometheus `/metrics` + 可用性阈值告警 webhook |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号池 / 用量 / 积分构成 / 任务中心 / 模型与档位 / 配置 / 运行日志，见 [Web 管理面板](#-web-管理面板) |
 
-## 🎯 成长任务一键完成（17/18）
+### 架构总览
+
+```mermaid
+flowchart LR
+    Client["客户端 / SDK\nOpenAI / Anthropic 请求"] --> H
+
+    subgraph GWI["xibie2api 网关 :7863"]
+        H["HTTP Handler\n鉴权 · 提示词改写 · 协议适配 · 轮转"] --> P
+        H --> S
+        P["账号池\n快过期加权 · 成本分层 · 熔断 · 冷却 · 租约"] --> U
+        S["会话粘性路由"] -.绑定镜像.-> REDIS
+        T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃 10 · 保活 22 · 夜猫子 23 · 成长 01"] --> P
+        U["上游 Client\nChatHTTP 流式 · 短 RPC"]
+    end
+
+    P -. "读凭证 (0600)" .-> AUTH[("auths/*.json")]
+    P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
+    U -->|"chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
+    U -->|"billing / auth / growth"| CB
+```
+
+三条协议（Chat Completions / Responses / Anthropic Messages）在入站侧各自归一化为内部 Chat Completions 请求体，共用 `prepareTurn` / `runTurn` 执行管线，仅在响应渲染层分叉，因此协议间不会漂移。上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
+
+### 成长任务一键完成（17/18）
 
 官方「成长计划」的 18 个成长任务中，**17 个可在面板上一键纯 API 完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余任务展示操作指引。
 
-### 任务覆盖与奖励
+#### 任务覆盖与奖励
 
 | 任务 | 奖励 | 一键完成方式 |
 |---|---|---|
@@ -97,19 +106,19 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 **全新账号一键全做完 ≈ +1950 credits +78 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1` 各数条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
 
-### 不可自动的 1 个
+#### 不可自动的 1 个
 
 | 任务 | 原因 |
 |---|---|
 | `Expert_Philanthropy` | 需真实捐款（服务端领奖时校验捐赠回执，已实测无法绕过） |
 
-### 实现原理（简述）
+#### 实现原理（简述）
 
 任务计分走 `/v2/report` 行为上报，但**不同任务认不同客户端指纹**：CLI 指纹（`www.codebuddy.cn`）、桌面指纹（`copilot.tencent.com` + `WorkBuddy/5.5.6` UA + `workbuddy-desktop` 事件族）、web 指纹（`www.workbuddy.cn` + `x-client-platform: web`）。网关为每类任务构造对应指纹的判据事件链（`internal/upstream/desktop.go`）；专家类任务额外要求真实专家 id 与真实对话回执（`internal/upstream/streak.go` 之外的 expert 序列）。上报 200 ≠ 计分——面板在执行后轮询任务进度，达标即自动调用 Web 域领奖接口。
 
 > ⚠️ 行为事件按天幂等：重复点「一键完成」不会重复扣资源，已达标的任务自动跳过。
 
-### 🧭 任务中心（面板新视图）
+#### 任务中心（面板视图）
 
 「任务中心」视图把散落的任务能力收拢成一处：
 
@@ -144,75 +153,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 </details>
 
-### 连登兑换与抽奖（自动）
+#### 连登兑换与抽奖（自动）
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
-
-## 🆚 与上游的差异
-
-本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
-
-### 新增
-
-| 能力 | 说明 |
-|---|---|
-| **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
-| **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
-| **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
-| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
-| **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
-| **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
-| **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
-| **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
-| **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
-| **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
-| **多 API Key（`api_keys`）** | 每把钥匙各自限定可调用的模型（`*`/`?` 通配）与出口域（`cn`/`global`），越权请求在网关本地 400 挡掉、不消耗额度；匹配常量时间、支持热生效。附逐 Key 用量台账（`data/key-usage.json`，只存指纹与备注名，不存密钥原文）+ 面板「用量 → API Key 用量」视图。未配置时行为与引入前逐字节一致 |
-| **可观测与告警（`metrics` / `alerting`）** | `GET /metrics` 暴露 Prometheus 文本格式指标（手写实现，零新依赖；默认关闭，关闭时 404，鉴权与 `/status` 同口径）。`alerting` 在健康账号数跌破阈值时向 webhook 推告警、恢复后推恢复通知，带 HMAC-SHA256 签名与 `X-Timestamp`；持续故障按冷却重复提醒，推送失败不切状态、下轮重试。全部热生效 |
-| **输出复读检测（`features.loop_guard`）** | 推理模型退化时会陷入复读——同一句/同一段原样刷屏直到撞上输出上限或空闲超时。上游一路 200 正常吐帧，网关既有的降级重试与熔断都拦不住，**积分按 token 实扣**。本分支检测「流尾 768 字节完全周期性」即中止该次上游读取，**不罚号、不轮转**（复读是模型行为，换个号大概率复现）。缺省开启，可用 `features.loop_guard: false` 关闭 |
-| **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
-| **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
-
-### 同步上游
-
-**第一轮（fork 基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
-
-**第二轮（`9a87758` → `ea8b1e5`，2026-09-14，只吸收底层）**：
-
-| 上游改动 | 吸收内容 |
-|---|---|
-| 净化增强 | `tool_calls.arguments` 盲区修复（content=null 的工具调用轮此前完全漏净化）、裸 `11128` 反探测改写、桌面版身份句（逗号形态）漏网修复、反馈句整句改写 |
-| 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
-| 并发修复 | 客户端 IP 改按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
-| 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
-| 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
-| report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
-
-未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
-
-> 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
-
-## 架构总览
-
-```mermaid
-flowchart LR
-    Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
-
-    subgraph GWI["WorkBuddy2API 网关 :7863"]
-        H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
-        H --> S
-        P["账号池\n快过期加权 · 成本分层 · 熔断 · 冷却 · 租约"] --> U
-        S["会话粘性路由"] -.绑定镜像.-> REDIS
-        T["定时调度\n签到 09/21 · 旅行 09/21 · 活跃 10 · 保活 22"] --> P
-        U["上游 Client\nChatHTTP 流式 · 短 RPC"]
-    end
-
-    P -. "读凭证 (0600)" .-> AUTH[("auths/*.json")]
-    P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
-    U -->|"chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
-    U -->|"billing / auth / growth"| CB
-```
-
-上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
 ## 快速开始
 
@@ -233,16 +176,16 @@ mkdir -p auths data && cp config.example.json config.json
 #    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
 
 # 2. 拉取并运行
-docker run -d --name workbuddy2api \
+docker run -d --name xibie2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/sijin-xb/xibie2api:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 ```
 
-> **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-panel` →
+> **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `xibie2api` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
 >
 > 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
@@ -252,8 +195,8 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
-cd workbuddy2api-panel
+git clone https://github.com/sijin-xb/xibie2api.git
+cd xibie2api
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
@@ -398,6 +341,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `global.chat_base` | 空 | 国际版上游聊天 base 覆盖；空 = 内置默认 `https://www.workbuddy.ai` |
 | `global.billing_base` | 空 | 国际版上游 billing base 覆盖；空 = 内置默认 `https://www.workbuddy.ai` |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `features.loop_guard` | `true` | 输出复读检测：流尾窗口完全周期性即中止该次上游读取（不罚号、不轮转）。缺省开启；显式 `false` 关闭。详见[输出复读检测](#输出复读检测featuresloop_guard) |
 | `prompt.mode` | `passthrough` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough`（默认）= 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径（相对路径基准 = 进程工作目录；systemd 单元 `WorkingDirectory` = 安装目录，即 `config.json` 同目录）；空 = 内置默认（约 2KB）；路径非空但不可读**或内容为空/纯空白** → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
@@ -419,9 +363,17 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
 | `model_aliases` | `[]` | **模型别名映射**（#5）：数组，元素 `{"from":"外部模型名","to":"网关目标模型名"}`。精确匹配；命中后把请求模型名替换为 `to`（可带 `cn:`/`global:` 前缀或裸名），再走既有 realm 解析与选号/策略管线。空/缺省 = 无别名（行为不变）。`from` 不得含 `:`；重复 `from`、`from` 含 `:`/空白/`*`、`to` 为空或含空白/`*`、链式别名均在启动/保存时**报错**（fail fast） |
 | `api_keys` | `[]` | **多 API Key**：数组，元素 `{"key":"...","name":"...","models":["glm-*"],"realm":"global","enabled":true}`。每把钥匙各自限定可调用的模型（支持 `*`/`?` 通配）与出口域。空/缺省 = 不启用，鉴权完全回落顶层 `api_key`（行为逐字节不变）。配了之后顶层 `api_key` **不再放行 `/v1/*`**（退居面板后备密钥）。详见[多 API Key](#多-api-keyapi_keys) |
-| `metrics.enabled` | `false` | 是否暴露 `GET /metrics`（Prometheus 文本格式）。关闭时该路径返回 404。热生效。详见[可观测与告警](#可观测与告警metrics--alerting) |
-| `alerting.*` | 见下 | 账号池可用性阈值告警：`enabled` / `webhook_url` / `secret` / `min_healthy`（缺省 1）/ `cooldown`（缺省 30m）/ `interval`（缺省 1m）。缺省全关。全部热生效。详见[可观测与告警](#可观测与告警metrics--alerting) |
-| `features.loop_guard` | `true` | 输出复读检测：流尾窗口完全周期性即中止该次上游读取（不罚号、不轮转）。缺省开启；显式 `false` 关闭。详见[输出复读检测](#输出复读检测featuresloop_guard) |
+| `metrics.enabled` | `false` | 是否暴露 `GET /metrics`（Prometheus 文本格式）。关闭时该路径返回 404。热生效。详见[可观测与告警](#-可观测与告警) |
+| `alerting.*` | 全关 | 账号池可用性阈值告警：`enabled` / `webhook_url` / `secret` / `min_healthy`（缺省 1）/ `cooldown`（缺省 30m）/ `interval`（缺省 1m）。缺省全关。全部热生效。详见[可观测与告警](#-可观测与告警) |
+| `web_search.enabled` | `false` | 是否启用 `/v1/messages` 的 `web_search` 服务端工具；关闭时客户端声明该工具回 `web_search_tool_result_error`。装配期构建，改后需重启 |
+| `web_search.backend` | `brave` | 检索后端：`brave`（缺省，无 key；配 `api_key` 走官方 API）/ `bing` / `duckduckgo` / `searxng`（需 `base_url`）/ `tavily`（需 `api_key`） |
+| `web_search.base_url` | 空 | searxng 后端地址（如 `http://127.0.0.1:8899`）；searxng 后端必填 |
+| `web_search.api_key` | 空 | tavily / brave 官方 API 密钥；tavily 后端必填 |
+| `web_search.max_results` | `5` | 单次检索返回结果数上限 |
+| `web_search.timeout` | `10s` | 单次检索超时 |
+| `web_search.proxy` | 空 | 出站代理；空 = 回落 `HTTP(S)_PROXY` 环境变量 |
+| `web_search.query_mode` | `model` | 查询串来源：`model` = 用模型把用户问题提炼成搜索查询（多一次轻量上游调用，命中率更高）；`raw` = 直接用最后一条 user 文本 |
+| `web_search.query_model` | 空 | 查询提炼用的模型（可带 `cn:`/`global:` 前缀）；空 = 用请求自身模型 |
 
 ### 模型别名映射（`model_aliases`）
 
@@ -471,6 +423,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 - **配了 `api_keys` 之后，顶层 `api_key` 不再放行 `/v1/*`**，退居面板 / 管理接口的后备密钥。否则"收窄权限"可以被万能钥匙绕过，等于没收窄。想继续用单密钥就别配 `api_keys`。
 - **匹配是常量时间的**：`SHA-256` 摘要 + `subtle.ConstantTimeCompare`，逐条比较且不提前返回，命中索引用常量时间选择累积，耗时与命中位置无关。
 - **白名单在别名替换之后判定**：别名命中的目标名同样参与白名单（否则"给别名起的名字"会成为绕过白名单的后门）。
+- **`x-api-key` 也认**：Anthropic 客户端（Claude Code / ZCode）用 `x-api-key` 头而非 `Authorization: Bearer`，两条路径都参与匹配。
 - **热生效**：面板保存配置即在线替换匹配表，无需重启（`api_keys` 不在需重启字段清单里）。
 - **未配置时行为与引入前逐字节一致**：回落顶层 `api_key` 的单密钥语义。
 - 校验 fail fast：启用条目密钥为空 / 含空白 / 含 `*`、密钥重复、`realm` 非法、`models` 含空模式，都在启动或面板保存时报错。
@@ -483,116 +436,6 @@ curl -s http://localhost:7863/v1/chat/completions \
 - **配置里配了但一次没用过的钥匙也占一行**，否则"某把钥匙是不是没人用"无法回答。
 - 只有来自显式配置条目的请求才落台账行（顶层单 key 与不鉴权模式不产生行）。
 
-### 可观测与告警（`metrics` / `alerting`）
-
-**`GET /metrics`** — Prometheus 文本格式（exposition format 0.0.4）。手写实现，**不引入 `prometheus/client_golang`**：本仓库的依赖纪律是「能不加就不加」（前端 go:embed 单文件、零外部构建依赖），指标只有十几个 gauge/counter，文本格式真正要遵守的规范面（名字字符集、标签转义、HELP/TYPE 行）小到可以手工正确实现并用测试锁住。
-
-默认关闭：`metrics.enabled=false` 时该路径返回 **404**（不是 501），对端口扫描器表现为不存在。鉴权与 `/status` 同口径（Bearer）——指标含账号数与逐账号积分，不该匿名可读；Prometheus 侧用 `scrape_configs[].authorization.credentials` 传密钥。
-
-| 指标 | 类型 | 说明 |
-|---|---|---|
-| `workbuddy_build_info{version}` | gauge | 恒 1，用于版本对齐 |
-| `workbuddy_uptime_seconds` | gauge | 进程运行时长 |
-| `workbuddy_accounts{state}` | gauge | 池规模：`total` / `healthy` / `cooling` / `disabled` / `in_flight_full` |
-| `workbuddy_realm_servable{realm}` | gauge | 0/1，与 `/healthz` 的 `realm_servable` 同口径 |
-| `workbuddy_account_credits{uid,realm}` | gauge | 逐账号剩余积分 |
-| `workbuddy_account_healthy{uid}` | gauge | 0/1（未禁用且未冷却，与 `/status` 同口径） |
-| `workbuddy_requests_in_flight` | gauge | 在途请求数 |
-| `workbuddy_requests_total{outcome}` | counter | 已完成请求：`succeeded` / `failed` |
-| `workbuddy_request_duration_seconds_avg` | gauge | 平均端到端耗时 |
-| `workbuddy_usage_tokens_total{kind}` | counter | `prompt` / `completion` / `total` |
-| `workbuddy_usage_credits_total` | counter | 上游 `usage.credit` 累计扣除 |
-| `workbuddy_cache_tokens_total{result}` | counter | 前缀缓存 `hit` / `miss` |
-| `workbuddy_tool_pairing_events_total{direction}` | counter | 出站工具配对自愈事件：`merged_adjacent` / `repacked` / `dropped_tool_call` / `dropped_tool_result`（`dropped_*` = 客户端坏历史被剔除的条目数，真实数据丢失） |
-| `workbuddy_native_tool_repair_total{result}` | counter | 原生工具调用标记还原：`seen`（识别到的标记块）/ `converted`（还原出的调用）/ `rejected`（识别到但未还原——残留风险面，建议单独告警） |
-
-指标口径刻意与既有观测**同源**（`pool.CountsDetailed` / `ServableForRealm` / `reqlog.Snapshot` / `usage.Totals`），不在渲染层另算一套——否则 `/status`、面板、`/metrics` 三处数字迟早对不上，而「哪个数字是真的」是最难查的一类问题。
-
-**可用性阈值告警（`alerting`）** — 最典型的故障形态是「账号全被冷却/禁用，但进程还活着」：`/healthz` 返 503、`/v1/*` 返 `no_healthy_account`，可若没有外部告警，你只有在客户端报错时才会发现。
-
-```json
-"alerting": {
-  "enabled": true,
-  "webhook_url": "https://hooks.example.com/workbuddy",
-  "secret": "shared-secret",
-  "min_healthy": 1,
-  "cooldown": "30m",
-  "interval": "1m"
-}
-```
-
-- 健康账号数 `< min_healthy` → 推 `alert`；回到阈值以上 → 推 `recovery`。
-- **持续故障按 `cooldown` 重复提醒**——长时间故障只提醒一次等于没提醒，值班的人换班后就再也收不到信号了。
-- **推送失败不切换状态**：保持原状态、下一轮立即重试。告警被静默吞掉，是告警系统最不能接受的失败方式。
-- 关闭或 `webhook_url` 为空时状态机复位：重新启用会重新告警一次，而不是沿用旧状态导致恢复通知永不发出。
-- `min_healthy` 缺省 1（写 0 视为未填写——否则条件 `healthy < 0` 恒假，等于静默失效）。校验 fail fast：启用但 `webhook_url` 为空、URL 非 http/https、时长非法或非正数，启动/面板保存即报错。
-- 全部字段热生效（监控器每轮重新读取 livecfg 快照，无需重启）。
-
-请求体：
-
-```json
-{"event":"alert","service":"workbuddy2api","version":"1.13.0","healthy":0,"total":3,
- "threshold":1,"timestamp":1753600000,"at":"2026-10-12T20:00:00+08:00"}
-```
-
-请求头：`Content-Type: application/json`、`X-Timestamp: <unix 秒>`（与请求体 `timestamp` 同值）、`secret` 非空时 `X-Signature: sha256=<hex>`。
-
-接收方校验（Python 示例）：
-
-```python
-import hmac, hashlib
-mac = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-assert hmac.compare_digest("sha256=" + mac, request.headers["X-Signature"])
-# 再校验 X-Timestamp 与 body["timestamp"] 一致且时间新鲜，防旧报文重放
-```
-
-**工具调用链路告警（Prometheus 示例）** — `workbuddy_tool_pairing_events_total` 与 `workbuddy_native_tool_repair_total` 刻画「客户端坏历史被自愈」与「原生标记还原失败」，是**静默数据丢失 / 功能失效**的可观测面。网关内置 `alerting`（上面的 webhook）只管账号可用性，不管这些——需要在 Prometheus 侧加规则：
-
-```yaml
-groups:
-  - name: workbuddy-toolchain
-    rules:
-      # 原生标记识别到却没还原：Codex 会把标记当正文，回合空转（残留风险面）
-      - alert: WorkbuddyNativeToolRepairRejected
-        expr: increase(workbuddy_native_tool_repair_total{result="rejected"}[5m]) > 0
-        labels: { severity: warning }
-        annotations:
-          summary: "原生工具调用标记识别到但未还原（5m 内 {{ $value }} 次），检查 dsml 判定与上游输出形态"
-      # 配对清理剔除了无法配对的条目 = 真实数据丢失（客户端没写回工具结果）
-      - alert: WorkbuddyToolPairingDropped
-        expr: increase(workbuddy_tool_pairing_events_total{direction=~"dropped_.*"}[5m]) > 0
-        labels: { severity: info }
-        annotations:
-          summary: "出站工具配对清理剔除了 {{ $value }} 个条目（客户端坏历史），该会话上下文有损"
-```
-
-> `merged_adjacent` / `repacked` 是**无损归一**，正常客户端（Codex Desktop 并行调用形状）上会持续出现，**不建议告警**——只在排查工具调用异常时观察。
-
-### 输出复读检测（`features.loop_guard`）
-
-推理模型偶发退化时会陷入复读：同一句话或同一段「行动短句」被无限重复，直到撞上上游输出上限或空闲超时。**这不是报错**——上游一路 200 正常吐帧，网关既有的降级重试（`content_blocked`）与熔断都拦不住它，而**积分按 token 实扣**。一个号陷入循环就是一路静默烧钱。
-
-检测口径刻意做得极保守：只看**流尾窗口是否完全周期性**。
-
-```
-尾部 768 字节若存在某个 4..128 字节的周期 p（s[i] == s[i-p] 全部成立），
-且该周期内至少含两个不同字节 → 判定复读
-```
-
-- **为什么要求占满整个窗口**：真复读（同一句原样刷屏）瞬间满足；正常长文本哪怕反复讨论同一话题、反复列同样的清单，也不会逐字节重复 6 次以上。
-- **周期下限 4 字节**：经典推理复读是反复刷 `Hmm.` / `Wait.` 这类极短单元（5~6 字节），下限取 8 会整类漏检。
-- **为什么还要"至少两个不同字节"**：装饰性分隔线（`======`、`──────`）在语义上是 period=1，不是复读——短周期下限放宽后必须守住这个边界。
-- **正文与推理都看**：`content` 与 `reasoning_content` 一起计入，推理模型的复读通常先发生在推理里。
-- **累计不足 1KB 不判定**：短回复不可能构成复读。
-
-命中后的处置：**中止该次上游读取**（越早停越省钱），按 **502 + 流内 error 帧** 告知客户端；**不罚号、不轮转**——复读是模型行为而非账号故障，同一 body 换个号大概率复现同样的退化，轮转只会把烧钱乘以号数。与 `11101` / `11115` / 图片无效同一哲学：请求内容或模型侧问题，不牵连账号健康。
-
-```json
-"features": { "loop_guard": false }   // 关闭（缺省 true）
-```
-
-> 已知边界：检测挂在**流式**路径（`pumpFrames`）上，非流式聚合路径（`AggregateObserved`）尚未覆盖。
-
 ### 上游超时语义（三段各归其位）
 
 | 字段 | 作用对象 | 默认 | 行为 |
@@ -601,7 +444,7 @@ groups:
 | `header_timeout_seconds` | 聊天 SSE **首字节前** | `120` | 由 `Transport.ResponseHeaderTimeout` 约束；超时 = 换号重发 |
 | `idle_timeout_seconds` | 聊天 SSE **流中空闲** | `1800` | 活跃吐数据续命不掐；静默超时才断流释放租约。默认 1800s 覆盖长推理静默（实测 >300s），太小会在长思考回合误掐上游读 |
 
-聊天流（`stream` true / false 均同）**没有总时长上限**：聊天使用 `Timeout=0` 的专用 client，长思考 / 长输出不会被掐断。
+聊天流（`stream` true / false 均同）**没有总时长上限**：聊天使用 `Timeout=0` 的专用 client，长思考 / 长输出不会被掐断。网关自身不再主动掐上游读的静默期，但客户端侧仍可能按字节空闲断流——由[流式 SSE 注释心跳](#流式-sse-注释心跳)兜底。
 
 ### 环境变量覆盖
 
@@ -673,6 +516,31 @@ INFO: [server] stream ...: repaired N native tool call(s) from assistant text (t
 WARN: [server] stream ...: saw M native tool call block(s) but repaired none (tool names known=K)
 ```
 
+### 输出复读检测（`features.loop_guard`）
+
+推理模型偶发退化时会陷入复读：同一句话或同一段「行动短句」被无限重复，直到撞上上游输出上限或空闲超时。**这不是报错**——上游一路 200 正常吐帧，网关既有的降级重试（`content_blocked`）与熔断都拦不住它，而**积分按 token 实扣**。一个号陷入循环就是一路静默烧钱。
+
+检测口径刻意做得极保守：只看**流尾窗口是否完全周期性**。
+
+```
+尾部 768 字节若存在某个 4..128 字节的周期 p（s[i] == s[i-p] 全部成立），
+且该周期内至少含两个不同字节 → 判定复读
+```
+
+- **为什么要求占满整个窗口**：真复读（同一句原样刷屏）瞬间满足；正常长文本哪怕反复讨论同一话题、反复列同样的清单，也不会逐字节重复 6 次以上。
+- **周期下限 4 字节**：经典推理复读是反复刷 `Hmm.` / `Wait.` 这类极短单元（5~6 字节），下限取 8 会整类漏检。
+- **为什么还要"至少两个不同字节"**：装饰性分隔线（`======`、`──────`）在语义上是 period=1，不是复读——短周期下限放宽后必须守住这个边界。
+- **正文与推理都看**：`content` 与 `reasoning_content` 一起计入，推理模型的复读通常先发生在推理里。
+- **累计不足 1KB 不判定**：短回复不可能构成复读。
+
+命中后的处置：**中止该次上游读取**（越早停越省钱），按 **502 + 流内 error 帧** 告知客户端；**不罚号、不轮转**——复读是模型行为而非账号故障，同一 body 换个号大概率复现同样的退化，轮转只会把烧钱乘以号数。与 `11101` / `11115` / 图片无效同一哲学：请求内容或模型侧问题，不牵连账号健康。
+
+```json
+"features": { "loop_guard": false }   // 关闭（缺省 true）
+```
+
+> 已知边界：检测挂在**流式**路径（`pumpFrames`）上，非流式聚合路径（`AggregateObserved`）尚未覆盖。
+
 ### 错误分类与账号处置
 
 上游错误由 `Classify` 统一分类（判定优先级：余额耗尽 → session 失效 → 限流文案 → 状态码兜底），账号处置如下：
@@ -681,11 +549,13 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
 | 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`（模型级）带「将在 … 重置」时**冷却到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
+| 频控（共享维度） | 60s 窗内 ≥2 个不同 UID 命中「无重置墙钟、无 Retry-After」的 429 | **判定出口 IP/设备指纹级限流**，回溯撤销窗内误记的账号级软冷却并终止轮转（fail-fast） | 窗口自然解除（60s） |
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
+| 输出复读 | 流尾完全周期性（`ErrLoopDetected`） | **不罚账号、不轮转**，中止读取并回 502 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
 请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
@@ -716,12 +586,13 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 同一会话尽量复用同一账号，多轮对话不跳号：
 
 - 会话键提取顺序：`metadata.conversation_id` → `metadata.conversationId` → `metadata.user_id` → 顶层 `conversation_id` → 顶层 `conversationId`（snake_case 优先于 camelCase）
+- 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天 TTL）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
 
 ### 定时任务
 
-五类任务各自独立排程、各有开关，互不影响。容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
+六类任务各自独立排程、各有开关，互不影响。容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
 
 | 任务 | 开关（默认 true） | 时刻（默认） | 行为 |
 |---|---|---|---|
@@ -730,6 +601,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
+| 成长任务队列 | `schedule.growth_enabled` | `growth_hours` `[1]` 整点 | 自动扫描全部账号待办并执行成长任务队列（Sequential 族每日零点解锁） |
 
 #### 禁用账号与保号任务（`schedule.include_disabled_in_tasks`）
 
@@ -779,7 +651,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 无需配置，跟随签到排程；到天数那天自动完成「兑换 → 抽奖」，无需人工盯。
 
-**关闭定时任务**：用 `schedule.*_enabled: false` 显式关闭（四个都设 `false` 则调度器不空转，直接阻塞等待退出信号）。注意两点语义：
+**关闭定时任务**：用 `schedule.*_enabled: false` 显式关闭（都设 `false` 则调度器不空转，直接阻塞等待退出信号）。注意两点语义：
 
 - **空数组与 `null` 表示「未配置 → 回落默认」**，不是「禁用」；真正关闭请用 `*_enabled: false`
 - **禁用不会擦除小时配置**：`*_hours` 原样保留，改回 `true` 即恢复原时点；小时值必须是 0-23，非法值启动即报错
@@ -830,9 +702,9 @@ http://127.0.0.1:7863/panel/
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
-| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
+| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」）+ **API Key 用量**区块（逐 Key 请求 / 失败 / token / 积分 / 活跃天 / 最近使用，窗口独立于上方时间控件；数据源 `data/key-usage.json`，只含指纹与备注名） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
-| **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
+| **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#任务中心面板视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动 |
@@ -854,11 +726,13 @@ http://127.0.0.1:7863/panel/
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
-**配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
+### 配置热生效
+
+保存配置后，`api_key`、`api_keys`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、`features.loop_guard`、
+`logging.request_client_info`、`metrics.*`、`alerting.*`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`prompt.mode`、`prompt.file`、
 `session_sticky.ttl`、`session_sticky.gc_interval`、`logging.request_archive_enabled`、`logging.request_retention_days`、
-`logging.request_archive_max_mb`、`server.read_timeout`）
+`logging.request_archive_max_mb`、`server.read_timeout`、`web_search.*`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
 
@@ -878,7 +752,7 @@ http://127.0.0.1:7863/panel/
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
-**鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
+**鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer / `x-api-key` 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
 
@@ -886,15 +760,15 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游自然返回错误） |
-| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API 兼容（Codex 客户端直连）；流式/非流式；归一化为 Chat Completions 复用同一条执行管线；错误信封为 Responses 形态 `{"error":{"message","type","param","code"}}` |
-| `POST /v1/messages` | Bearer（`api_key` 非空时） | Anthropic Messages API 子集（Claude 客户端直连）；流式/非流式；复用同一条执行管线。支持矩阵见「Anthropic Messages 兼容」 |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 10min；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
-| `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
-| `GET /metrics` | Bearer（同上） | Prometheus 文本格式指标（`metrics.enabled=true` 时；否则 404）。见「可观测与告警」 |
+| `POST /v1/chat/completions` | Bearer / `x-api-key`（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游自然返回错误） |
+| `POST /v1/responses` | Bearer / `x-api-key`（`api_key` 非空时） | OpenAI Responses API 兼容（Codex 客户端直连）；流式/非流式；归一化为 Chat Completions 复用同一条执行管线；错误信封为 Responses 形态 `{"error":{"message","type","param","code"}}` |
+| `POST /v1/messages` | Bearer / `x-api-key`（`api_key` 非空时） | Anthropic Messages API 子集（Claude 客户端直连）；流式/非流式；复用同一条执行管线。支持矩阵见「Anthropic Messages 兼容」 |
+| `GET /v1/models` | Bearer / `x-api-key`（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 10min；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率/限时优惠 `promo_*` 等全字段（上游有返回时） |
+| `GET /status` | Bearer / `x-api-key`（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
+| `GET /metrics` | Bearer / `x-api-key`（同上） | Prometheus 文本格式指标（`metrics.enabled=true` 时；否则 404）。见[可观测与告警](#-可观测与告警) |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
-> 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+> 鉴权规则：仅当 `api_key` 非空才校验密钥；密钥取 `Authorization: Bearer <api_key>` 或 Anthropic 风格的 `x-api-key: <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
@@ -902,7 +776,7 @@ http://127.0.0.1:7863/panel/
 {"healthy": 2, "total": 3, "service": "workbuddy2api"}
 ```
 
-响应同时带 `X-Service: workbuddy2api` 头。这两个身份标识用于区分**本网关**与同端口上可能残留的其他服务——对方即使返回 2xx 也不会带该字段 / 头，宿主探测据此避免"假成功"。
+响应同时带 `X-Service: workbuddy2api` 头（`service` 字段与 `X-Service` 头取自代码常量 `server.ServiceName`，与项目名无关）。这两个身份标识用于区分**本网关**与同端口上可能残留的其他服务——对方即使返回 2xx 也不会带该字段 / 头，宿主探测据此避免"假成功"。
 
 **宿主健康探测指引**：强校验（推荐）用 `/status` + `api_key`——只有持有正确 `api_key` 的本网关返回 200，其他服务返回 401 / 404；弱校验（不适合持 key 的负载均衡器）用 `/healthz` + `service` 字段判据（`/healthz` 恒无鉴权，`service == "workbuddy2api"` 才算命中本网关）。容器自带 `HEALTHCHECK` 用的就是弱校验（仅进程内自检，够用）。
 
@@ -912,6 +786,12 @@ http://127.0.0.1:7863/panel/
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 - 正文里的原生工具调用标记在透传前还原为 `delta.tool_calls`（见「原生工具调用标记还原」）：命中时一帧会拆成「正文帧 + N 个调用帧 + 收尾帧」，上游的 `finish_reason: stop` 改写为 `tool_calls` 且排在调用帧之后；未命中时逐字节透传
+
+### 流式 SSE 注释心跳
+
+上游在长推理阶段可能连续数分钟一个 data 帧都不发（deepseek-v4.1-flash 实测静默 >300s）。客户端按**字节空闲**判流断开（Codex 的 `stream_idle_timeout_ms` 默认约 300s，报 `idle timeout waiting for SSE` 后重试整个回合），长回合会被腰斩。
+
+网关在写流的同时每 **15s** 补一帧标准 SSE 注释 `: keepalive`：注释行被所有标准 SSE 解析器忽略（对事件序列零影响），但提供字节活动，客户端空闲计时器因此不会走满。心跳与帧写入共用一把锁，保证不交错；三条协议（chat / responses / messages）统一接入。这是**客户端侧**超时的兜底，网关自己掐上游读的 `upstream.idle_timeout_seconds` 是另一层（默认已调到 1800s）。
 
 ### Anthropic Messages 兼容（`POST /v1/messages`）
 
@@ -923,17 +803,17 @@ http://127.0.0.1:7863/panel/
 |---|---|
 | `model` | 原始客户端串；别名 / `cn:`/`global:` 前缀解析照常 |
 | `max_tokens` | **必填**，正整数（缺失/非正/非整数 → 400） |
-| `messages` | 角色 `user`/`assistant`；`content` 为字符串或块数组 |
+| `messages` | 角色 `user`/`assistant`，另支持**中途 `system`**（mid-conversation-system beta，原地映射为 OpenAI `system` 消息、保持位置，不折叠进顶层 system）；`content` 为字符串或块数组 |
 | `system` | 字符串，或 `{type:"text",text}` 块数组（按序拼接）→ 前置一条 `system` |
 | `stream` | 缺省 `false` |
 | `temperature` / `top_p` | 同名转发 |
 | `stop_sequences` | → OpenAI `stop` |
-| `tools` | `{name,description,input_schema}` → `{type:"function",function:{...}}` |
+| `tools` | `{name,description,input_schema}` → `{type:"function",function:{...}}`；`type` 形如 `web_search_*` 的条目是服务端工具，**不**转发成 function（见下节） |
 | `tool_choice` | `{type:"auto"}`→`auto`；`{type:"any"}`→`required`；`{type:"none"}`→`none`；`{type:"tool",name}`→`{type:"function",function:{name}}` |
 | `output_config.effort` | → 出站 `reasoning_effort`（走既有档位降级管线）；`output_config.format` 等其余键忽略 |
 | `thinking.type` | `enabled`/`disabled` → 出站 `thinking.type`；`budget_tokens` 忽略（档位由 `reasoning_effort` 表达） |
 
-消息块映射：`text`→文本；`image`（`source.type` 为 `base64`/`url`）→`image_url`；assistant 的 `tool_use`→`tool_calls`；user 的 `tool_result`→`role:"tool"` 消息（顺序保持，绝不当成用户文本）。
+消息块映射：`text`→文本；`image`（`source.type` 为 `base64`/`url`）→`image_url`；assistant 的 `tool_use`→`tool_calls`；user 的 `tool_result`→`role:"tool"` 消息（顺序保持，绝不当成用户文本）——`tool_result.content` 支持 text 与 **image** 块（Claude Code 的 Read 工具读图会带图片，仅含文本时仍拼成字符串，含图片时输出多模态 parts 数组）。
 
 **无法表达的内容块丢弃而非 400**：`thinking`、`redacted_thinking`、`server_tool_use`、`web_search_tool_result` 及未知 `type`——上游 OpenAI 形态无法表达它们，**丢弃（记 INFO）**。理由：客户端回放的会话历史会带这些块（思考块随每次对话被回传、服务端检索块是本网关自己产出的），逐个 400 会让**旧聊天记录全部无法继续**。丢弃安全：这些块对上游模型不是必需输入（思考块是上一轮过程产物，服务端检索信息已随正文进入历史）。若某条 assistant / mid-conversation `system` 消息的块**全部**被丢弃，整条消息跳过（空消息同样会被上游拒绝）。
 
@@ -941,9 +821,11 @@ http://127.0.0.1:7863/panel/
 
 **明确拒绝（400 `invalid_request_error`，命名该字段）**：`max_tokens` 缺失/非正/非整数、未知 `tool_choice.type`、字段类型错误、`tool_use` 缺 `id`/`name`、`image.source.type` 非法、`tool_result` 内嵌未知块等**形态错误**。
 
-**响应**：非流式返回 Anthropic `message` 对象（`content` 文本 / `tool_use` 块、`stop_reason`、`usage.input_tokens`/`output_tokens`）；流式返回标准事件序列 `message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（可多个块，index 单调）→ `message_delta` → `message_stop`。上游 error 帧映射为 `event: error`。`stop_reason` 映射：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`、`content_filter`→`refusal`、未知/空→`end_turn`；`stop_sequence` 恒为 `null`（上游 OpenAI 形态无法识别命中哪条 stop 序列）。错误信封为 `{"type":"error","error":{"type":"<...>","message":"..."}}`（按 HTTP 状态映射类型；Anthropic 无 `gateway_hint` 字段，网关 hint 折进 `message`）。
+**响应**：非流式返回 Anthropic `message` 对象（`content` 文本 / `tool_use` 块、`stop_reason`、`usage.input_tokens`/`output_tokens`）。流式返回标准事件序列 `message_start` → `content_block_start`/`content_block_delta`/`content_block_stop`（可多个块，index 单调）→ `message_delta` → `message_stop`。上游 error 帧映射为 `event: error`。
 
-> 已知限制：流式 `message_start.usage.input_tokens` 取发出时已观测到的值——上游通常在**末帧**才给 usage，故流式下多为 0，`output_tokens` 以 `message_delta` 的末帧 usage 为准（不伪造）。
+- **思维链**：上游 `delta.reasoning_content` / `message.reasoning_content` 映射为 Anthropic `thinking` 内容块（流式 `thinking_delta`，排在正文块之前；非流式作为 `content` 数组首个 `thinking` 块）——否则走 `/v1/messages` 的客户端看不到思考链，长思考回合表现为长时间无输出。
+- **`usage`**：`message_start` 的 `input_tokens` 取发出时已观测到的 `prompt_tokens`；上游通常在**末帧**才给 usage，故 `message_start` 下多为 0，网关在 `message_delta` 补发末帧 `input_tokens` 与 `output_tokens`（客户端据此更新上下文占用，不伪造）。
+- `stop_reason` 映射：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`、`content_filter`→`refusal`、未知/空→`end_turn`；`stop_sequence` 恒为 `null`（上游 OpenAI 形态无法识别命中哪条 stop 序列）。错误信封为 `{"type":"error","error":{"type":"<...>","message":"..."}}`（按 HTTP 状态映射类型；Anthropic 无 `gateway_hint` 字段，网关 hint 折进 `message`）。
 
 ### Web 搜索（`web_search` 服务端工具）
 
@@ -958,7 +840,7 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 ```json
 "web_search": {
   "enabled": true,
-  "backend": "searxng",          // searxng / brave / bing / duckduckgo / tavily
+  "backend": "searxng",          // searxng / brave / bing / duckduckgo / tavily（缺省 brave）
   "base_url": "http://127.0.0.1:8899",  // searxng
   "api_key": "",                  // tavily / brave（官方 API）
   "max_results": 5,
@@ -974,12 +856,14 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 | backend | 说明 |
 |---|---|
 | `searxng` | **推荐**。自建 SearXNG（`docker run -d -p 127.0.0.1:8899:8080 -v <dir>:/etc/searxng searxng/searxng`），`settings.yml` 里开 `search.formats: [html, json]`。聚合引擎、稳定、无 key。 |
-| `brave` | search.brave.com HTML 抓取，无 key；配 `api_key` 时改走 Brave 官方 API。无 key 时易 429。 |
+| `brave` | 缺省。search.brave.com HTML 抓取，无 key；配 `api_key` 时改走 Brave 官方 API。无 key 时易 429。 |
 | `bing` | Bing RSS（`&format=rss`），无 key；**实测结果质量差**（易返回无关推广），仅兜底。 |
 | `duckduckgo` | html.duckduckgo.com HTML 抓取，无 key；**实测常被 bot 挑战拦截**。 |
 | `tavily` | Tavily API（需 `api_key`）。 |
 
 > 注意：检索**不计入**客户端 usage 记账（属网关侧调用），且 `query_mode: "model"` 会让每次 web_search 请求多消耗一次上游额度。
+>
+> ZCode 客户端的内置 WebSearch 是 provider-native 工具，只在 provider 类型为 `anthropic-messages`（或 `openai-responses`）时挂载；`scripts/enable-zcode-websearch.sh` 可把 ZCode 的 provider 切到 `anthropic-messages` 并给模型打开 `supportsNativeWebSearch`（幂等，改完需重启 ZCode）。
 
 ### 上游端点
 
@@ -1015,7 +899,9 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 
 出站请求统一携带 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1` UA（global 账号第二段为 `WorkBuddy AI`；可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
-## 请求级日志
+## 📊 可观测与告警
+
+### 请求级日志
 
 每个 `/v1/chat/completions` 请求结束时输出一行表格日志（stdout）：
 
@@ -1035,6 +921,95 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 | `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长 |
 
 **敏感度**：日志不含任何 token 明文（详见[安全与合规](#安全与合规)），无落盘日志文件。
+
+### Prometheus `/metrics`
+
+`GET /metrics` 暴露 Prometheus 文本格式指标（exposition format 0.0.4）。手写实现，**不引入 `prometheus/client_golang`**：本仓库的依赖纪律是「能不加就不加」（前端 go:embed 单文件、零外部构建依赖），指标只有十几个 gauge/counter，文本格式真正要遵守的规范面（名字字符集、标签转义、HELP/TYPE 行）小到可以手工正确实现并用测试锁住。
+
+默认关闭：`metrics.enabled=false` 时该路径返回 **404**（不是 501），对端口扫描器表现为不存在。鉴权与 `/status` 同口径（Bearer / `x-api-key`）——指标含账号数与逐账号积分，不该匿名可读；Prometheus 侧用 `scrape_configs[].authorization.credentials` 传密钥。
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `workbuddy_build_info{version}` | gauge | 恒 1，用于版本对齐 |
+| `workbuddy_uptime_seconds` | gauge | 进程运行时长 |
+| `workbuddy_accounts{state}` | gauge | 池规模：`total` / `healthy` / `cooling` / `disabled` / `in_flight_full` |
+| `workbuddy_realm_servable{realm}` | gauge | 0/1，与 `/healthz` 的 `realm_servable` 同口径 |
+| `workbuddy_account_credits{uid,realm}` | gauge | 逐账号剩余积分 |
+| `workbuddy_account_healthy{uid}` | gauge | 0/1（未禁用且未冷却，与 `/status` 同口径） |
+| `workbuddy_requests_in_flight` | gauge | 在途请求数 |
+| `workbuddy_requests_total{outcome}` | counter | 已完成请求：`succeeded` / `failed` |
+| `workbuddy_request_duration_seconds_avg` | gauge | 平均端到端耗时 |
+| `workbuddy_usage_tokens_total{kind}` | counter | `prompt` / `completion` / `total` |
+| `workbuddy_usage_credits_total` | counter | 上游 `usage.credit` 累计扣除 |
+| `workbuddy_cache_tokens_total{result}` | counter | 前缀缓存 `hit` / `miss` |
+| `workbuddy_tool_pairing_events_total{direction}` | counter | 出站工具配对自愈事件：`merged_adjacent` / `repacked` / `dropped_tool_call` / `dropped_tool_result`（`dropped_*` = 客户端坏历史被剔除的条目数，真实数据丢失） |
+| `workbuddy_native_tool_repair_total{result}` | counter | 原生工具调用标记还原：`seen`（识别到的标记块）/ `converted`（还原出的调用）/ `rejected`（识别到但未还原——残留风险面，建议单独告警） |
+
+指标口径刻意与既有观测**同源**（`pool.CountsDetailed` / `ServableForRealm` / `reqlog.Snapshot` / `usage.Totals`），不在渲染层另算一套——否则 `/status`、面板、`/metrics` 三处数字迟早对不上，而「哪个数字是真的」是最难查的一类问题。
+
+### 可用性阈值告警（`alerting`）
+
+最典型的故障形态是「账号全被冷却/禁用，但进程还活着」：`/healthz` 返 503、`/v1/*` 返 `no_healthy_account`，可若没有外部告警，你只有在客户端报错时才会发现。
+
+```json
+"alerting": {
+  "enabled": true,
+  "webhook_url": "https://hooks.example.com/workbuddy",
+  "secret": "shared-secret",
+  "min_healthy": 1,
+  "cooldown": "30m",
+  "interval": "1m"
+}
+```
+
+- 健康账号数 `< min_healthy` → 推 `alert`；回到阈值以上 → 推 `recovery`。
+- **持续故障按 `cooldown` 重复提醒**——长时间故障只提醒一次等于没提醒，值班的人换班后就再也收不到信号了。
+- **推送失败不切换状态**：保持原状态、下一轮立即重试。告警被静默吞掉，是告警系统最不能接受的失败方式。
+- 关闭或 `webhook_url` 为空时状态机复位：重新启用会重新告警一次，而不是沿用旧状态导致恢复通知永不发出。
+- `min_healthy` 缺省 1（写 0 视为未填写——否则条件 `healthy < 0` 恒假，等于静默失效）。校验 fail fast：启用但 `webhook_url` 为空、URL 非 http/https、时长非法或非正数，启动/面板保存即报错。
+- 全部字段热生效（监控器每轮重新读取 livecfg 快照，无需重启）。告警监控协程恒启动（否则「启动时关闭、之后在面板里打开」将永远没有监控在跑），关闭态每轮只读一次配置。
+
+请求体：
+
+```json
+{"event":"alert","service":"workbuddy2api","version":"1.13.0-panel","healthy":0,"total":3,
+ "threshold":1,"timestamp":1753600000,"at":"2026-10-12T20:00:00+08:00"}
+```
+
+请求头：`Content-Type: application/json`、`X-Timestamp: <unix 秒>`（与请求体 `timestamp` 同值）、`secret` 非空时 `X-Signature: sha256=<hex>`。
+
+接收方校验（Python 示例）：
+
+```python
+import hmac, hashlib
+mac = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest("sha256=" + mac, request.headers["X-Signature"])
+# 再校验 X-Timestamp 与 body["timestamp"] 一致且时间新鲜，防旧报文重放
+```
+
+### 工具调用链路告警（Prometheus 示例）
+
+`workbuddy_tool_pairing_events_total` 与 `workbuddy_native_tool_repair_total` 刻画「客户端坏历史被自愈」与「原生标记还原失败」，是**静默数据丢失 / 功能失效**的可观测面。网关内置 `alerting`（上面的 webhook）只管账号可用性，不管这些——需要在 Prometheus 侧加规则：
+
+```yaml
+groups:
+  - name: workbuddy-toolchain
+    rules:
+      # 原生标记识别到却没还原：Codex 会把标记当正文，回合空转（残留风险面）
+      - alert: WorkbuddyNativeToolRepairRejected
+        expr: increase(workbuddy_native_tool_repair_total{result="rejected"}[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "原生工具调用标记识别到但未还原（5m 内 {{ $value }} 次），检查 dsml 判定与上游输出形态"
+      # 配对清理剔除了无法配对的条目 = 真实数据丢失（客户端没写回工具结果）
+      - alert: WorkbuddyToolPairingDropped
+        expr: increase(workbuddy_tool_pairing_events_total{direction=~"dropped_.*"}[5m]) > 0
+        labels: { severity: info }
+        annotations:
+          summary: "出站工具配对清理剔除了 {{ $value }} 个条目（客户端坏历史），该会话上下文有损"
+```
+
+> `merged_adjacent` / `repacked` 是**无损归一**，正常客户端（Codex Desktop 并行调用形状）上会持续出现，**不建议告警**——只在排查工具调用异常时观察。
 
 ## 部署运维
 
@@ -1058,6 +1033,7 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
+| `scripts/enable-zcode-websearch.sh` | 把 ZCode provider 切到 `anthropic-messages` 并打开 `supportsNativeWebSearch`，启用内置 WebSearch（幂等，改完需重启 ZCode） |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
 
@@ -1094,34 +1070,117 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - Session 失效账号被禁用（`disabled_reason` 透出在 `/status`）后，可用 `./login.sh` 重新登录覆盖凭证；已持久化 `disabled=true` 的账号可在源码侧调用 `Pool.ReviveDisabled(uid)` 复活（`state.json` 中清除 `disabled` 标志）
 - 备份 = `auths/`（凭证）+ `data/state.json`（池状态：积分 / 冷却 / 计数）；配置 Upstash 后状态另镜像至 Redis（7 天 TTL）
 
+## 🆚 与上游的差异
+
+> **fork 溯源链**：`Sliverkiss/workbuddy2api`（原版，2026-09 删库）→ `linguo2625469/workbuddy2api-panel`（面板分支）→ **`sijin-xb/xibie2api`（本项目）**。
+> `origin` = 本项目，`upstream` remote = `linguo2625469/workbuddy2api-panel`；`main` 领先上游 34 个提交、落后 0。本项目在上游面板分支之上独立演进，演进以本仓库为准。
+
+### 本项目（xibie2api）相对上游的增量
+
+以下为本 fork 自己的提交（均已在真实多账号环境验证），相对 `linguo2625469/workbuddy2api-panel`：
+
+| 能力 | 说明 | 相关提交 |
+|---|---|---|
+| **多协议适配 + 共享执行管线** | 新增 `POST /v1/responses`（OpenAI Responses，Codex 直连）与 `POST /v1/messages`（Anthropic Messages 子集，Claude Code 直连），与既有 `/v1/chat/completions` 共用同一条 `prepareTurn` / `runTurn` 管线（别名 / realm / 提示词 / 脱敏 / 选号 / 出站传输不漂移）。新增 `PumpFrames` + `FrameSink` 帧泵，各协议只写自己的渲染层；原生工具调用标记还原（DSML）三条协议复用 | `dafc0a5` |
+| **模型别名（`model_aliases`）** | 客户端发来的厂商模型名（`claude-sonnet-4-5` / `gpt-5`）精确映射到网关支持的模型，匹配发生在 realm 前缀解析之前，选号 / 安全处理全部沿用既有管线 | `dafc0a5` |
+| **多 API Key（`api_keys`）** | 每把钥匙限定可调用模型（`*`/`?` 通配）与出口域（cn/global），越权本地 400、不消耗额度；常量时间匹配；配了 `api_keys` 后顶层 `api_key` 不再放行 `/v1/*`。附逐 Key 用量台账（`data/key-usage.json`，只存指纹与备注名）+ 面板「用量 → API Key 用量」区块 | `026c67b` `1b715cb` |
+| **`x-api-key` 鉴权** | Anthropic 客户端（Claude Code / ZCode）用 `x-api-key` 而非 `Authorization: Bearer`，网关两条路径都认（`apikey` + `httpauth`） | `7b83d3f` |
+| **web_search 服务端工具** | `/v1/messages` 识别 Anthropic `web_search_*` 服务端工具，由网关自己执行检索（可插拔后端 searxng/brave/bing/duckduckgo/tavily），结果回填 `server_tool_use` + `web_search_tool_result` 内容块并注入出站 prompt；附 `scripts/enable-zcode-websearch.sh` | `7b83d3f` |
+| **Anthropic Messages 兼容大修** | mid-conversation `system` 原地映射、`tool_result` 支持图片块、`output_config`/`thinking` 改为映射（而非 400）、专有字段（`top_k`/`container`/`mcp_servers`/`context_management`/`service_tier`）接受并忽略、`reasoning_content`→`thinking` 块、`message_delta` 补 `input_tokens`、无法表达的内容块丢弃而非 400 | `417d5f3` `b3fe8e3` `0cd7795` `53061ab` `502246f` `0fc7e9f` `7b83d3f` |
+| **Responses / Codex 内置工具适配** | `namespace` 工具（multi_agent_v1 / mcp__node_repl）摊平为 `<ns>__<tool>` 普通 function 并在回程还原为带 `namespace` 的 item；`custom`（apply_patch）降级为单字符串参数 function 并在回程还原为 `custom_tool_call`；无法表达的内置工具（如 `web_search`）跳过而非 400 | `b0aa7ad` `562dc7f` |
+| **输出复读检测（`features.loop_guard`）** | 流尾 768 字节完全周期性即中止该次上游读取，返回 502 + 流内 error 帧，**不罚号不轮转**（复读是模型行为，换号大概率复现）。缺省开启，可关 | `1a04658` |
+| **Prometheus `/metrics` + 可用性告警** | 手写 Prometheus 文本格式指标（零新依赖，默认关闭时 404，鉴权与 `/status` 同口径）；健康账号数跌破阈值推 webhook 告警（HMAC-SHA256 + `X-Timestamp`），推送失败不切状态、下轮重试。全部热生效 | `4ab10e5` |
+| **工具调用链路可观测** | `workbuddy_tool_pairing_events_total` / `workbuddy_native_tool_repair_total` 刻画「客户端坏历史被自愈」与「原生标记还原失败」；README 附示例 Prometheus 告警规则；`mcp_servers` 被忽略时记 WARN | `0ae7ba1` `371537c` |
+| **流式 SSE 注释心跳** | 每 15s 补一帧 `: keepalive`（SSE 解析器忽略，零事件影响），修长推理回合（实测静默 >300s）被客户端空闲超时腰斩；`upstream.idle_timeout_seconds` 默认 300→1800 | `07b7f6d` |
+| **429 共享维度限流 fail-fast** | 60s 窗内 ≥2 个不同 UID 命中「无重置墙钟、无 Retry-After」的 429 → 判定出口 IP/设备指纹级限流，回溯撤销窗内误记的账号级软冷却并终止轮转，不再逐号误冷却 | `96662b4` |
+| **回归测试 + CI 质量门禁** | 三协议端到端回归、帧泵回归、别名 / API Key / 告警 / 复读检测等单测；`.github/workflows/ci.yml` 跑 gofmt / vet / test / build | `dafc0a5` `4555566` `cac1928` |
+| **promo 字段透出回归测试** | 锁定「限时优惠 `promo_*` 字段透出」逻辑（透出逻辑本身继承自上游，此处仅补回归测试） | `5b14b74` |
+
+### 继承自面板分支（相对原版 `Sliverkiss/workbuddy2api`）
+
+以下是 `linguo2625469/workbuddy2api-panel` 相对原版 `Sliverkiss/workbuddy2api` 的增量，本项目原样继承：
+
+| 能力 | 说明 |
+|---|---|
+| **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
+| **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
+| **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
+| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
+| **模型锁池视图** | 面板「账号池」聚合展示被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数与解锁倒计时 |
+| **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
+| **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
+| **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
+| **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限 / 限时优惠 `promo_*` 等上游真实字段 |
+| **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
+| **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
+| **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
+
+### 同步上游历史
+
+**第一轮（面板分支基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
+
+**第二轮（`9a87758` → `ea8b1e5`，2026-09-14，只吸收底层）**：
+
+| 上游改动 | 吸收内容 |
+|---|---|
+| 净化增强 | `tool_calls.arguments` 盲区修复（content=null 的工具调用轮此前完全漏净化）、裸 `11-128` 反探测改写、桌面版身份句（逗号形态）漏网修复、反馈句整句改写 |
+| 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
+| 并发修复 | 客户端 IP 改按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
+| 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
+| 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
+| report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
+
+未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
+
+> 原版 `Sliverkiss/workbuddy2api` 此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，面板分支已完整吸收；本 fork 在面板分支之上继续演进，此后与更上游不再有同步关系。
+
 ## 安全与合规
 
-### 1. 凭据管理（auths）
+### 使用声明（必读）
+
+本项目的开发初衷只有一个：**方便个人管理自己的 CodeBuddy 账号**——自动签到、保活、给自己的本地工具提供一个 OpenAI 兼容入口。它是免费、开源、按「原样」提供的个人自用工具。
+
+近期我们发现有人将本项目（含上游）用于以下行为：**批量注册小号 / 收购账号对外提供付费 API、共享池、代充**；或**二次加壳、捆绑卡密（授权码）售卖**，以「公益服」「低价中转」等名义变相收费分发。我们对此表达最强烈的反对，并声明：
+
+1. **一切商用 / 售卖行为与本项目及作者无关。** 本项目不授权、不支持、不参与任何面向公众的 API 售卖、账号池出租、卡密收费分发；行为人由此产生的一切后果（账号封禁、条款违约、法律风险等）由其自行承担。
+2. **批量注册与转售接口配额违反目标平台服务条款。** CodeBuddy / 腾讯系服务条款禁止批量注册账号及商业转售接口。
+3. **请勿购买任何「收费版」「卡密版」「公益中转版」。** 本项目永远免费开源。任何加壳、加密、捆绑收费的「版本」都是他人篡改的产物；此类分发无法审计，存在被植入后门、回传并窃取你 CodeBuddy 凭证的风险（`auths/` 中保存的是明文 accessToken / refreshToken）。
+4. **关于开源协议的诚实说明。** 本项目基于 MIT 协议开源，协议允许自由使用与修改源码——但 MIT 赋予的是代码层面的自由，**不赋予**以本项目名义宣传、售卖、捆绑分发，或要求作者提供支持与背书的权利。作者不为任何第三方分发版本提供支持、更新承诺或安全保证。
+5. **作者保留止损的权利。** 若滥用行为持续，作者可能随时停止维护、关闭或删除仓库，且不另行通知。
+
+如果你的用途是管理自己的账号，欢迎正常使用、反馈问题与提交 PR。
+
+### 凭据管理（auths）
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
-### 2. 网络暴露与日志敏感度
+### 网络暴露与日志敏感度
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 
-### 3. 发布来源与合规边界
+### 发布来源与合规边界
 
-- **发布来源**：CI 构建发布 GHCR 多架构镜像（`.github/workflows/docker-ghcr.yml`）与 `v*` tag 的五平台二进制 + `checksums.txt`（`.github/workflows/go-binaries.yml`）；亦可从源码自构建（Dockerfile 多阶段）
+- **发布来源**：CI 构建发布 GHCR 多架构镜像（`.github/workflows/docker-ghcr.yml`）与 `v*` tag 的五平台二进制 + `checksums.txt`（`.github/workflows/go-binaries.yml`）；质量门禁见 `.github/workflows/ci.yml`（gofmt/vet/test/build）；亦可从源码自构建（Dockerfile 多阶段）
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
 - **校验和**：发布产物附 CI 生成的 `checksums.txt`；`go.sum` 仅约束 Go 模块依赖
-- 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
+- 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI / Anthropic 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
-### 4. 授权使用边界
+### 授权使用边界
 
 - 仅限**本人授权账号**、本机 / 私有环境测试
-- 不得共享、转售、违规分发，或用于违反目标平台条款的用途；**严禁批量注册账号做 API 业务、二次加壳或捆绑卡密售卖**——详见顶部[使用声明（必读）](#使用声明必读)
+- 不得共享、转售、违规分发，或用于违反目标平台条款的用途；**严禁批量注册账号做 API 业务、二次加壳或捆绑卡密售卖**——详见[使用声明（必读）](#使用声明必读)
 - 遵守 CodeBuddy 平台服务条款与所在地法律
 - 妥善保管 `auths/`（明文凭证）与网关端口
+
+### 免责声明
+
+本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
 
 ## 常见问题
 
@@ -1132,6 +1191,8 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **冷却到上游重置时间**：msg 带「将在 … 重置」时，账号冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
+
+> 与「共享维度限流」的区别：global 域的 429（`{"code":14003,...}`）无重置墙钟、无 Retry-After，实测限流维度是网关共享的出口 IP / 设备指纹而非账号——网关在 60s 窗内 ≥2 个不同 UID 命中时判定共享维度，回溯撤销误记的账号级软冷却并终止轮转，避免「莫名全池冷却」。
 
 ### 多图会话请求体超限怎么办？
 
@@ -1168,6 +1229,10 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 默认 `prompt.mode=passthrough`（透传客户端原始 system）。若改用 `prompt.mode=custom`，网关会用自有提示词替换客户端 system，从源头消除大部分 system 来源误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
 
+### 长推理回合被客户端报 "idle timeout waiting for SSE" 怎么办？
+
+这是客户端按字节空闲判流断开（Codex 的 `stream_idle_timeout_ms`），上游推理阶段可能连续数分钟不发 data 帧。网关已内置每 15s 一帧 SSE 注释心跳兜底（见[流式 SSE 注释心跳](#流式-sse-注释心跳)）；同时把 `upstream.idle_timeout_seconds` 调到 1800s 以上覆盖最长推理静默。客户端侧若可配，也应把其空闲阈值调大。
+
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
 官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1` 现状（指纹净化考虑，可配而非改死）。
@@ -1183,24 +1248,33 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32`（`defaultDeepSeekEffort`） |
 | `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:70`（`backfillReasoningContent`） |
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
-| 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
+| 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（`Trigger`）、`:46`（`nextMidnightCST`） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:214`（`modelRateLimitCode`）、`:435`（`ParseRateReset`） |
-| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:159`（`badParamsMarkerMsg`）、`:202`（`badParamsMarkerCode`）；处理分支 `internal/server/handler.go`（`applyErrorPolicy` 的 `ErrBadParams`） |
-| 出站 UA 覆盖（空 = 内置默认 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go`（`upstream.user_agent`）；接线 `cmd/server/main.go`（`up.UserAgent`） |
+| `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:159`（`badParamsMarkerMsg`）、`:202`（`badParamsMarkerCode`）；处理分支 `internal/server/handler.go:830`（`applyErrorPolicy` 的 `ErrBadParams`） |
+| 出站 UA 覆盖（空 = 内置默认 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go`（`upstream.user_agent`）；接线 `cmd/server/main.go:157`（`up.UserAgent`） |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/entry.go:530`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/state.go:62` |
 | disabled 账号透出 `disabled_reason` | `internal/pool/entry.go:92`（`DisabledReason` 字段）、`internal/pool/state.go:578`（写入） |
-| 硬冷却至次日 04:00 | `internal/pool/cooldown.go:464`（`CooldownUntilTomorrow4AM`） |
+| 硬冷却至次日 04:00 | `internal/pool/cooldown.go:501`（`CooldownUntilTomorrow4AM`） |
 | 软冷却退避封顶 2h | `internal/pool/entry.go:510`（`defaultSoftRateMax`） |
-| Top-5 候选短名单 | `internal/pool/pick.go`（`pick` 的 top5 短名单截断） |
+| Top-5 候选短名单 | `internal/pool/pick.go:82`（`pick` 的 top5 短名单截断） |
 | `activity_hours` 默认 `[10]` | `cmd/server/config.go`（`Default()`） |
 | 活跃自检回读 streak | `internal/scheduler/scheduler.go:559`（`checkActivityStreak`） |
 | streak 端点 `activity/growth/streak` | `internal/upstream/travel.go:24`（`streakPath` 常量）、`:139`（`GrowthStreak`） |
 | Redis 粘性镜像 7 天 TTL | `internal/redisstore/redisstore.go:22`（`keyTTL`） |
-
-## 免责声明
-
-本项目仅供学习和研究使用。使用者需遵守 CodeBuddy 服务条款，自行承担使用风险（包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
+| 三协议共用执行管线 | `internal/server/turn.go:44`（`runTurn`）、`internal/server/turn_prepare.go:42`（`prepareTurn`） |
+| 模型别名仅精确匹配、先于 realm 解析 | `internal/server/alias.go:20`（exact match 语义） |
+| 多 API Key 常量时间匹配 | `internal/apikey/apikey.go:214`（legacy）、`:226`（逐条 `subtle.ConstantTimeCompare`） |
+| 逐 Key 台账只存指纹 | `internal/apikey/apikey.go:78`（`Fingerprint` = sha256 前 8 字节）；台账落盘 `internal/keyusage/keyusage.go`（文件 `data/key-usage.json`） |
+| Anthropic `reasoning_content` → thinking 块 | `internal/server/messages_render.go:276`（流式）、`:533`（非流式） |
+| `message_delta` 补 `input_tokens` | `internal/server/messages_render.go:487` |
+| 复读检测窗口 768 字节 / 周期下限 4 字节 | `internal/upstream/loopguard.go:31`（`loopWindow`）、`:40`（`loopMinUnit`） |
+| SSE 注释心跳 15s | `internal/server/keepalive.go:28`（`sseKeepaliveInterval`） |
+| 429 共享维度 fail-fast（60s 窗 / 阈值 2） | `internal/server/ratelimit.go`（`rateIPThreshold = 2`） |
+| Prometheus 文本格式手写、零依赖 | `internal/metrics/metrics.go`（exposition format 0.0.4） |
+| 告警 HMAC-SHA256 签名 | `internal/alert/alert.go:193`（`hmac.New`）、`:208`（`X-Signature`） |
+| `/healthz` 身份标识 | `internal/server/handler.go:142`（`ServiceName = "workbuddy2api"`） |
+| 热生效字段清单（含 api_keys / metrics / alerting / loop_guard） | `internal/livecfg/livecfg.go`；需重启字段 `cmd/server/main.go:561`（`restartRequiredFields`） |
 
 ## License
 
