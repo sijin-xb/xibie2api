@@ -695,8 +695,10 @@ func mapAnthropicTools(tools []any, messages []any) ([]any, *messagesWebSearch, 
 		if !ok {
 			return nil, nil, invalidMessages(fmt.Sprintf("tools[%d]", i), "tool must be an object")
 		}
-		if styp, _ := tool["type"].(string); strings.TrimSpace(styp) != "" {
-			// 服务端工具：按类型分派，不进入 function 工具列表。
+		// 服务端工具：按类型分派，不进入 function 工具列表。
+		// type:"custom" 是 Anthropic SDK 对**客户端**工具的合法标注（TS/Python 均为
+		// `type?: "custom" | null`），语义等同普通 function，不能当服务端工具丢弃。
+		if styp, _ := tool["type"].(string); strings.TrimSpace(styp) != "" && !strings.EqualFold(strings.TrimSpace(styp), "custom") {
 			if strings.HasPrefix(styp, "web_search") {
 				if ws == nil {
 					ws = &messagesWebSearch{query: lastUserText(messages)}
@@ -794,8 +796,10 @@ func lastUserText(messages []any) string {
 		if q == "" {
 			continue
 		}
-		if len(q) > 512 {
-			q = q[:512]
+		// 按 rune 截断到 512 字符：字节切片会切断多字节 UTF-8 字符，产出非法串
+		// （查询串会进检索、注入出站 prompt、回显给客户端）。
+		if r := []rune(q); len(r) > 512 {
+			q = string(r[:512])
 		}
 		return q
 	}

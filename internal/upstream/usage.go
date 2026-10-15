@@ -128,6 +128,21 @@ func UsageCacheMissTokens(usage map[string]any) (float64, bool) {
 	return 0, false
 }
 
+// UsageCacheWriteTokens 返回 usage 里的缓存写入 token 数（多别名取最优）。上游对
+// 「写入」的命名不统一：Anthropic 形态 cache_creation_input_tokens、部分响应
+// prompt_cache_write_tokens。缺失时 ok=false（不臆造 0——0 与「未提供」语义不同）。
+func UsageCacheWriteTokens(usage map[string]any) (float64, bool) {
+	if usage == nil {
+		return 0, false
+	}
+	for _, key := range []string{"cache_creation_input_tokens", "prompt_cache_write_tokens"} {
+		if tokens, ok := positiveUsageNumber(usage[key]); ok {
+			return tokens, true
+		}
+	}
+	return 0, false
+}
+
 // usageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / json.Number 形态）。
 func usageNumber(usage map[string]any, key string) (float64, bool) {
 	v, ok := usage[key]

@@ -75,10 +75,13 @@ func (h *Handler) generateSearchQuery(ctx context.Context, p *turnParams, questi
 		return "", false
 	}
 	model := p.bareModel
+	realm := p.realm
 	if h.cfg.WebSearchQueryModel != "" {
-		model = h.cfg.WebSearchQueryModel
+		// 配置可带 realm 前缀（cn:/global:）。上游只认裸名，且选号必须按前缀的 realm
+		// ——否则会「按 global 前缀发 cn 号」并让带前缀的模型名出站（上游必拒）。
+		realm, model = resolveModel(h.cfg.WebSearchQueryModel)
 	}
-	acct := h.cfg.Pool.PickExcludingForRealm(map[string]bool{}, model, p.realm)
+	acct := h.cfg.Pool.PickExcludingForRealm(map[string]bool{}, model, realm)
 	if acct == nil {
 		return "", false
 	}

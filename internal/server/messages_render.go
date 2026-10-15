@@ -67,13 +67,18 @@ func (r messagesRenderer) renderError(w http.ResponseWriter, status int, code, m
 // ---------------------------------------------------------------------------
 
 // messagesToolCall 一个 tool_use 内容块的跨帧状态。
+//
+// Anthropic 内容块必须**顺序** start/delta/stop，而上游可能把多个并行 tool_call 的
+// arguments 分片**交错**下发（index 0/1 交替）。若在交错时分片只写给「当前打开的块」，
+// 另一个 index 的后续分片会被静默丢弃、拼出截断 JSON。因此这里按 index 缓冲全部分片，
+// 只在「切换到正文/思维链」或「流结束」时按 index 顺序一次性完整发出（见 flushTools）。
 type messagesToolCall struct {
 	openAIIndex int
 	blockIndex  int
 	id          string
 	name        string
-	args        strings.Builder
-	opened      bool
+	argFrags    []string // 该 index 的全部 arguments 分片（保序）
+	emitted     bool     // 是否已发出 content_block_start/delta/stop
 }
 
 // messagesSink 是 FrameSink 的 Anthropic 实现：拥有事件状态机（message_start 惰性
@@ -87,8 +92,8 @@ type messagesToolCall struct {
 //   - message_start 的 usage.input_tokens 取「发出时已观测到的 prompt_tokens」。上游
 //     通常在**末帧**才给 usage，因此流式下 input_tokens 多为 0；output_tokens 以
 //     message_delta 的末帧 usage 为准。
-//   - 假设同一 tool_call index 的 arguments 分片连续到达（上游实测如此）；跨 index
-//     交错分片不支持。
+//   - tool_use 块整块发出（按 index 顺序），不做逐分片流式：Anthropic 内容块必须严格
+//     顺序闭合，而上游可交错下发并行 tool_call 分片，整块发出是保持协议正确性的前提。
 type messagesSink struct {
 	w    io.Writer
 	fl   http.Flusher
@@ -98,9 +103,8 @@ type messagesSink struct {
 	started bool
 
 	nextIndex int
-	open      bool   // 是否有内容块处于打开状态
-	openKind  string // "text" | "tool" | "thinking"
-	openTool  int    // openKind=="tool" 时的 OpenAI tool index
+	open      bool   // 是否有内容块处于打开状态（仅 text/thinking；tool 块为原子发出）
+	openKind  string // "text" | "thinking"
 
 	textIndex     int // 已打开的 text 块 index（-1 = 无）
 	thinkingIndex int // 已打开的 thinking 块 index（-1 = 无）
@@ -177,14 +181,12 @@ func (s *messagesSink) emitSearchPrelude() error {
 }
 
 // webSearchResultContent 构造 web_search_tool_result 的 content：
-// 有结果 → 结果数组；失败/空 → web_search_tool_result_error（不伪造结果）。
+// 检索失败 → web_search_tool_result_error；检索成功但 0 结果 → **空结果数组**
+// （Anthropic 语义里「无结果」不是错误，错误码枚举也不含 no_results）；有结果 →
+// 结果数组。
 func webSearchResultContent(ws *messagesWebSearch) any {
-	if ws.err != "" || len(ws.results) == 0 {
-		code := "unavailable"
-		if ws.err == "" {
-			code = "no_results"
-		}
-		return map[string]any{"type": "web_search_tool_result_error", "error_code": code}
+	if ws.err != "" {
+		return map[string]any{"type": "web_search_tool_result_error", "error_code": "unavailable"}
 	}
 	arr := make([]any, 0, len(ws.results))
 	for _, r := range ws.results {
@@ -221,13 +223,14 @@ func (s *messagesSink) emit(event string, data map[string]any) error {
 }
 
 // ensureStarted 惰性发出 message_start（仅一次）。input_tokens 用当前已观测到的
-// prompt_tokens（未见 usage 时为 0，不伪造）。
+// usage 拆分（未见 usage 时三件套均为 0，不伪造）。
 func (s *messagesSink) ensureStarted() error {
 	if s.started {
 		return nil
 	}
 	s.started = true
-	input := int64(numberField(s.usage, "prompt_tokens"))
+	usage := messagesUsageFields(s.usage)
+	usage["output_tokens"] = 0 // message_start 时上游尚未产出正文
 	if err := s.emit("message_start", map[string]any{
 		"message": map[string]any{
 			"id":            s.msgID,
@@ -237,7 +240,7 @@ func (s *messagesSink) ensureStarted() error {
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage":         map[string]any{"input_tokens": input, "output_tokens": 0},
+			"usage":         usage,
 		},
 	}); err != nil {
 		return err
@@ -249,10 +252,24 @@ func (s *messagesSink) ensureStarted() error {
 // finish_reason。无可用 choices 的帧只捕获 usage 后返回。
 func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 	if u, ok := frame["usage"].(map[string]any); ok && u != nil {
-		s.usage = u
+		// 按 key 合并而非整表替换：上游可能在**不同帧**分别下发 prompt_tokens 与
+		// completion_tokens（末帧常只带 completion_tokens）。整表替换会丢掉前帧已知的
+		// prompt_tokens，使 message_delta.input_tokens 退回 0，客户端上下文占用被清零。
+		if s.usage == nil {
+			s.usage = map[string]any{}
+		}
+		for k, v := range u {
+			s.usage[k] = v
+		}
 	}
 	if err := s.ensureStarted(); err != nil {
 		return err
+	}
+	// error 帧即流终止：此后到达的任何 data 帧一律丢弃，绝不在 event: error 之后再发
+	// content 块（Anthropic 语义里 error 之后不应有任何事件；且 Done 在 sawError 时早退，
+	// 若此时仍开块会留下永不闭合的悬空块）。
+	if s.sawError {
+		return nil
 	}
 	choices, _ := frame["choices"].([]any)
 	if len(choices) == 0 {
@@ -301,8 +318,14 @@ func (s *messagesSink) Chunk(frame map[string]any, _ string) error {
 // appendThinking 累积思维链并保证 thinking 块处于打开状态，随后发出 thinking_delta。
 // thinking 块必须排在正文之前，正文块一旦打开就不再接受 thinking（上游实测顺序如此）。
 func (s *messagesSink) appendThinking(txt string) error {
-	if err := s.openThinkingBlock(); err != nil {
+	opened, err := s.openThinkingBlock()
+	if err != nil {
 		return err
+	}
+	if !opened {
+		// 已进入正文/tool 阶段：思维链阶段结束，忽略后续 thinking，绝不发 index:-1
+		// 的 delta（Anthropic SDK 按 index 取值，-1 会污染最后一个内容块）。
+		return nil
 	}
 	return s.emit("content_block_delta", map[string]any{
 		"index": s.thinkingIndex,
@@ -310,23 +333,29 @@ func (s *messagesSink) appendThinking(txt string) error {
 	})
 }
 
-// openThinkingBlock 保证当前打开的是 thinking 块；若当前打开的是别的块，说明思维链
-// 已结束（正文/tool 已开始），此时忽略后续 thinking，不再新开块。
-func (s *messagesSink) openThinkingBlock() error {
-	if s.open && s.openKind == "thinking" {
-		return nil
-	}
+// openThinkingBlock 保证当前打开的是 thinking 块。返回 opened=true 表示 thinking 块
+// 当前已打开（可直接发 delta）；false 表示思维链阶段已结束（正文/tool 已开始），调用方
+// 必须跳过本次 thinking 内容，不得发 delta。
+func (s *messagesSink) openThinkingBlock() (bool, error) {
 	if s.open {
-		return nil // 已进入正文/tool 阶段，思维链阶段结束
+		// 已打开某块：是 thinking 则可继续，否则说明思维链阶段已结束。
+		return s.openKind == "thinking", nil
+	}
+	// 开新块前先冲掉缓冲的 tool 块，保持到达顺序。
+	if err := s.flushTools(); err != nil {
+		return false, err
 	}
 	s.thinkingIndex = s.nextIndex
 	s.nextIndex++
 	s.open = true
 	s.openKind = "thinking"
-	return s.emit("content_block_start", map[string]any{
+	if err := s.emit("content_block_start", map[string]any{
 		"index":         s.thinkingIndex,
 		"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
-	})
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // appendText 累积正文并保证 text 块处于打开状态，随后发出 text_delta。
@@ -340,13 +369,18 @@ func (s *messagesSink) appendText(txt string) error {
 	})
 }
 
-// openTextBlock 保证当前打开的是 text 块；若当前打开的是别的块（tool_use），先 close
+// openTextBlock 保证当前打开的是 text 块；若当前打开的是别的块（thinking），先 close
 // 再新开 text 块（单调 index）。已在 text 块上时空操作。
 func (s *messagesSink) openTextBlock() error {
 	if s.open && s.openKind == "text" {
 		return nil
 	}
+	// 顺序要紧：先关闭当前打开块（thinking），再冲掉缓冲的 tool 块，最后开 text。
+	// 反序会在 thinking 未闭合时插入 tool 块，违反 Anthropic 顺序闭合约束。
 	if err := s.closeBlock(); err != nil {
+		return err
+	}
+	if err := s.flushTools(); err != nil {
 		return err
 	}
 	s.textIndex = s.nextIndex
@@ -359,8 +393,11 @@ func (s *messagesSink) openTextBlock() error {
 	})
 }
 
-// handleToolCall 处理一个 tool_call 分片：首现打开 tool_use 内容块，随后发出
-// input_json_delta。切换到不同 index 时先关闭当前块（保证单调 index 与顺序闭合）。
+// handleToolCall 缓冲一个 tool_call 分片。**不立即发出**任何事件：Anthropic 内容块
+// 必须严格顺序 start/delta/stop，而上游会把多个并行 tool_call 的 arguments 分片交错
+// 下发（index 0/1 交替）。立即发出会导致「只写给当前打开的块」，另一 index 的后续分片
+// 被静默丢弃、拼出截断 JSON。这里按 index 缓冲全部分片，由 flushTools 在「切到正文/
+// 思维链」或「流结束」时按 index 顺序整块发出。
 func (s *messagesSink) handleToolCall(tc map[string]any) error {
 	idx := 0
 	if v, ok := tc["index"].(float64); ok {
@@ -379,18 +416,25 @@ func (s *messagesSink) handleToolCall(tc map[string]any) error {
 		if name, ok := fn["name"].(string); ok && name != "" && st.name == "" {
 			st.name = name
 		}
+		if args, ok := fn["arguments"].(string); ok && args != "" {
+			st.argFrags = append(st.argFrags, args)
+		}
 	}
-	// 首次见到该 tool_call：关闭当前块，打开新的 tool_use 块。
-	if !st.opened {
-		if err := s.closeBlock(); err != nil {
-			return err
+	return nil
+}
+
+// flushTools 按 index 到达顺序把已缓冲的 tool_use 块整块发出：每个块
+// start → N 个 input_json_delta（保序分片，保留流式粒度）→ stop，再推进下一个。
+// 已发出（emitted）的块跳过，支持「工具 → 正文 → 工具」交错场景。
+func (s *messagesSink) flushTools() error {
+	for _, idx := range s.toolOrder {
+		st := s.toolCalls[idx]
+		if st == nil || st.emitted {
+			continue
 		}
 		st.blockIndex = s.nextIndex
 		s.nextIndex++
-		st.opened = true
-		s.open = true
-		s.openKind = "tool"
-		s.openTool = idx
+		st.emitted = true
 		if err := s.emit("content_block_start", map[string]any{
 			"index": st.blockIndex,
 			"content_block": map[string]any{
@@ -399,36 +443,29 @@ func (s *messagesSink) handleToolCall(tc map[string]any) error {
 		}); err != nil {
 			return err
 		}
-	}
-	if fn, ok := tc["function"].(map[string]any); ok {
-		if args, ok := fn["arguments"].(string); ok && args != "" {
-			st.args.WriteString(args)
-			// 仅当该 tool 块确实处于打开状态才发 delta（绝不向已停止块写 delta）。
-			if s.open && s.openKind == "tool" && s.openTool == idx {
-				if err := s.emit("content_block_delta", map[string]any{
-					"index": st.blockIndex,
-					"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
-				}); err != nil {
-					return err
-				}
+		for _, frag := range st.argFrags {
+			if err := s.emit("content_block_delta", map[string]any{
+				"index": st.blockIndex,
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": frag},
+			}); err != nil {
+				return err
 			}
+		}
+		if err := s.emit("content_block_stop", map[string]any{"index": st.blockIndex}); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// closeBlock 关闭当前打开的内容块（无打开块时空操作）。
+// closeBlock 关闭当前打开的内容块（无打开块时空操作）。仅 text/thinking 需要显式
+// close——tool 块在 flushTools 内自成 start/delta/stop，不经过这里。
 func (s *messagesSink) closeBlock() error {
 	if !s.open {
 		return nil
 	}
 	idx := s.textIndex
-	switch s.openKind {
-	case "tool":
-		if st := s.toolCalls[s.openTool]; st != nil {
-			idx = st.blockIndex
-		}
-	case "thinking":
+	if s.openKind == "thinking" {
 		idx = s.thinkingIndex
 	}
 	if err := s.emit("content_block_stop", map[string]any{"index": idx}); err != nil {
@@ -464,8 +501,8 @@ func (s *messagesSink) ErrorFrame(payload string) error {
 //   - 收到过上游 error 帧（含空流兜底帧）→ 不发任何成功终态。error 事件已是流的终止
 //     （Anthropic 语义），再补 message_delta(结束)+message_stop 会把失败读成正常收尾
 //     （与 Responses 的 sawError → response.failed 对齐）。
-//   - 否则关闭所有打开的内容块（空流则补一个空 text 块），随后发出 message_delta
-//   - message_stop，产出完整成功生命周期。
+//   - 否则关闭当前打开块、冲掉缓冲的 tool 块（空流则补一个空 text 块），随后发出
+//     message_delta + message_stop，产出完整成功生命周期。
 func (s *messagesSink) Done() error {
 	if s.sawError {
 		return nil
@@ -473,20 +510,28 @@ func (s *messagesSink) Done() error {
 	if err := s.ensureStarted(); err != nil {
 		return err
 	}
+	if err := s.closeBlock(); err != nil {
+		return err
+	}
+	// 冲掉流尾仍缓冲的 tool 块（tools 只在切块/收尾时整块发出，见 flushTools）。
+	if err := s.flushTools(); err != nil {
+		return err
+	}
 	if s.nextIndex == 0 {
 		// 空流（未打开任何块）：补一个空 text 块，保证 start/stop 成对。
 		if err := s.openTextBlock(); err != nil {
 			return err
 		}
-	}
-	if err := s.closeBlock(); err != nil {
-		return err
+		if err := s.closeBlock(); err != nil {
+			return err
+		}
 	}
 	output := int64(numberField(s.usage, "completion_tokens"))
-	input := int64(numberField(s.usage, "prompt_tokens"))
+	usage := messagesUsageFields(s.usage)
+	usage["output_tokens"] = output
 	if err := s.emit("message_delta", map[string]any{
 		"delta": map[string]any{"stop_reason": s.stopReason(), "stop_sequence": nil},
-		"usage": map[string]any{"input_tokens": input, "output_tokens": output},
+		"usage": usage,
 	}); err != nil {
 		return err
 	}
@@ -625,14 +670,39 @@ func messagesStopReason(finish string) string {
 	}
 }
 
-// messagesUsage 把 OpenAI usage 映射为 Anthropic usage（只保留 input_tokens /
-// output_tokens，不伪造 cache_creation_input_tokens / cache_read_input_tokens）。
+// messagesUsage 把 OpenAI usage 映射为 Anthropic usage。
+//
+// Anthropic 语义下 input_tokens 是**未命中缓存**的输入（客户端上下文占用 =
+// input_tokens + cache_read_input_tokens + cache_creation_input_tokens），而上游
+// prompt_tokens 是**含缓存**的总量。因此必须拆分：input_tokens = prompt_tokens
+// − 命中 − 写入，否则客户端把整段 prompt 当新输入、缓存维度又缺失，占用率与命中率
+// 同时失真。上游未给缓存维度时 cache 字段省略（不伪造 0）。
 func messagesUsage(resp map[string]any) map[string]any {
 	usage, _ := resp["usage"].(map[string]any)
-	return map[string]any{
-		"input_tokens":  int64(numberField(usage, "prompt_tokens")),
-		"output_tokens": int64(numberField(usage, "completion_tokens")),
+	return messagesUsageFields(usage)
+}
+
+// messagesUsageFields 从上游 usage 拆出 Anthropic 三件套。流式/非流式共用同一口径，
+// 避免两条路径的 input_tokens 定义漂移。
+func messagesUsageFields(usage map[string]any) map[string]any {
+	prompt := int64(numberField(usage, "prompt_tokens"))
+	read, hasRead := upstream.UsageCacheHitTokens(usage)
+	write, hasWrite := upstream.UsageCacheWriteTokens(usage)
+
+	out := map[string]any{"output_tokens": int64(numberField(usage, "completion_tokens"))}
+	noCache := prompt - int64(read) - int64(write)
+	if noCache < 0 {
+		// 上游字段不自洽（命中+写入 > 总量）：退回整段 prompt，不产出负数。
+		noCache = prompt
 	}
+	out["input_tokens"] = noCache
+	if hasRead {
+		out["cache_read_input_tokens"] = int64(read)
+	}
+	if hasWrite {
+		out["cache_creation_input_tokens"] = int64(write)
+	}
+	return out
 }
 
 // mapMessagesErrorType 按 HTTP 状态映射 Anthropic error.type。
