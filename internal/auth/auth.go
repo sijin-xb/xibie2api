@@ -79,6 +79,18 @@ func (a *Auth) DomainValue() string {
 	return a.Domain
 }
 
+// NicknameValue 加锁读取 Nickname（Pool.SetNickname 在 a.mu 内改写它，而
+// Pool.Status/pick 在 p.mu 下直读——两把不同的锁，无同步直读构成数据竞争，
+// go test -race 实证）。所有读点一律经此取值，勿直读字段。
+func (a *Auth) NicknameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
+}
+
 // RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
 // 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
 // `a.RefreshToken == ""`）必须经此取值，勿直读字段。

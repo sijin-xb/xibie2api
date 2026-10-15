@@ -62,8 +62,9 @@ func (r responsesRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 }
 
 // renderNonStream 把聚合后的 OpenAI chat.completion 转换为 Responses 对象写出。
-func (r responsesRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) {
+func (r responsesRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) bool {
 	writeJSON(w, http.StatusOK, responsesFromAggregate(resp, r.meta))
+	return true
 }
 
 // renderError 写出终态错误（Responses 信封；hint 非空时附 gateway_hint）。
@@ -220,12 +221,26 @@ func (m responsesMeta) parallelToolCallsValue() any {
 // finish_reason。无可用 choices 的帧只捕获 usage 后返回。
 func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 	if u, ok := frame["usage"].(map[string]any); ok && u != nil {
-		s.usage = u
+		// 按 key 合并而非整表替换：上游可能在不同帧分别下发 prompt_tokens 与
+		// completion_tokens（末帧常只带后者）。整表替换会丢掉前帧已知的
+		// prompt_tokens，使 response.completed.usage.input_tokens 退回 0。
+		if s.usage == nil {
+			s.usage = map[string]any{}
+		}
+		for k, v := range u {
+			s.usage[k] = v
+		}
 	}
 	// 首个上游帧即发出 created/in_progress（即使本帧无可渲染 delta），保证空流也有
 	// 完整起始事件。
 	if err := s.ensureStarted(); err != nil {
 		return err
+	}
+	// error 帧即流终止：此后到达的任何 data 帧一律丢弃，绝不在 error 之后再发
+	// output_text.delta 等事件（Responses 语义里 error 之后不应有输出，且这些
+	// 残留内容会进入最终 output）。
+	if s.sawError {
+		return nil
 	}
 	choices, _ := frame["choices"].([]any)
 	if len(choices) == 0 {
@@ -437,14 +452,16 @@ func (s *responsesSink) Done() error {
 		}
 		if st.ref.custom {
 			input := customToolInput(st.args.String())
-			if delta := input[st.customEmitted:]; delta != "" {
+			// customToolInput 在 arguments 仍是非法 JSON 时返回原文，拼成合法 JSON 后
+			// 返回更短的 input 字段值。裸切片 input[st.customEmitted:] 会在后者更短时
+			// 越界 panic（上游分片下发即触发），故复用带长度守卫的 customInputDelta。
+			if delta := customInputDelta(&st.customEmitted, st.args.String()); delta != "" {
 				if err := s.emit("response.custom_tool_call_input.delta", map[string]any{
 					"item_id": st.itemID, "output_index": st.outIndex, "delta": delta,
 				}); err != nil {
 					return err
 				}
 			}
-			st.customEmitted = len(input)
 			if err := s.emit("response.custom_tool_call_input.done", map[string]any{
 				"item_id": st.itemID, "output_index": st.outIndex, "input": input,
 			}); err != nil {

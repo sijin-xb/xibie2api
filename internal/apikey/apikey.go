@@ -99,6 +99,12 @@ func NewTable(entries []Entry, legacyKey string) (*Table, error) {
 		t.legacy = digest(legacyKey)
 		t.required = true
 	}
+	// 配了 api_keys 就要求鉴权（即便全部禁用）——否则「全部禁用」会让 required 保持
+	// false，Authenticate 首行直接放行，网关变成**无鉴权开放访问**（任意 key 可用、
+	// 白名单失效）。全部禁用时的正确语义是「拒绝一切」而非「放行一切」。
+	if len(entries) > 0 {
+		t.required = true
+	}
 	seen := map[string]bool{}
 	for i, e := range entries {
 		// 禁用条目只校验 realm 与 models 形态：它不参与匹配，因此允许把 key 清空
@@ -124,7 +130,6 @@ func NewTable(entries []Entry, legacyKey string) (*Table, error) {
 			c.models = append(c.models, strings.ToLower(strings.TrimSpace(m)))
 		}
 		t.entries = append(t.entries, c)
-		t.required = true
 	}
 	return t, nil
 }

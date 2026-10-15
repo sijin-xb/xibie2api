@@ -120,7 +120,11 @@ var softRateMarkers = []string{
 	"请求过于频繁", "限流",
 }
 
-var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+// sessionDeadMarkers 账号 session 失效的**精确文案**标记（大小写不敏感子串匹配）。
+// 不含裸业务码 "12153"——那会让 body 任意位置（requestId/计数/长度）出现该数字串时
+// 误判 session_dead，而该分支会走到 Pool.Disable（终态，须人工复活），一次误判即
+// 永久杀掉健康账号。业务码改由下方 hasBusinessCode 结构化判定。
+var sessionDeadMarkers = []string{"offline user session not found"}
 
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
@@ -239,6 +243,11 @@ func IsModelRateLimit(body string) bool {
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
+
+// sessionDeadCode 上游「session 失效」业务 code。只按结构化 code 字段判定（见
+// hasBusinessCode），不用裸子串——裸数字出现在 body 任意位置即误判，后果是账号被
+// 永久禁用（Pool.Disable 终态）。
+const sessionDeadCode = "12153"
 
 // modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
 // 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的
@@ -503,9 +512,14 @@ func Classify(status int, body string) ErrKind {
 	// 不得掩盖它们（429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须
 	// sessionDead——此层 marker 是精确词，比限流层的大范围子串更具体，具体优先于宽泛）。
 	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
+		if strings.Contains(lower, m) {
 			return ErrSessionDead
 		}
+	}
+	// 业务码 12153 走结构化判定（只认 JSON 信封里的 code 字段），不用裸子串——
+	// 后者会让 requestId 等字段里偶然出现的 "12153" 把健康账号判成 session_dead。
+	if hasBusinessCode(body, sessionDeadCode) {
+		return ErrSessionDead
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
@@ -982,7 +996,11 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 实测 JWT exp-iat 与 expiresIn 严格自洽（R-F），超量级值只会是上游脏数据，
 	// 照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh 永假 → token 永不刷新
 	// 反而真过期失效。
-	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
+	//
+	// 溢出守卫：expiresIn > ~9.22e9 秒时 time.Duration(v)*time.Second 会溢出为负数，
+	// 负值恒 < refreshTokenExpiresInMax，反而绕过上限校验 → ExpiresAt 写到过去 →
+	// NeedsRefresh 永真 → 刷新风暴。故先比秒数上限再相乘。
+	if tok.ExpiresIn > 0 && tok.ExpiresIn < int64(refreshTokenExpiresInMax/time.Second) {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil

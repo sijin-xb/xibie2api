@@ -25,8 +25,9 @@ type turnRenderer interface {
 	renderStream(w http.ResponseWriter, stats io.Reader, hint func() upstream.HintContext,
 		repair *upstream.MarkupRepair, onErrorFrame func(string)) error
 
-	// renderNonStream 将聚合后的上游响应写出为非流式响应。
-	renderNonStream(w http.ResponseWriter, resp map[string]any)
+	// renderNonStream 将聚合后的上游响应写出为非流式响应。返回 false 表示转换失败、
+	// 已写出错误信封（调用方据此**不得**把该跳记成账号成功）。
+	renderNonStream(w http.ResponseWriter, resp map[string]any) bool
 
 	// renderError 写出终态错误响应（hint 为空时不附加 gateway_hint）。
 	renderError(w http.ResponseWriter, status int, code, msg, hint string)
@@ -75,8 +76,9 @@ func streamOpts(repair *upstream.MarkupRepair, onErrorFrame func(string)) []upst
 	return opts
 }
 
-func (openAIRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) {
+func (openAIRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) bool {
 	writeJSON(w, http.StatusOK, resp)
+	return true
 }
 
 func (openAIRenderer) renderError(w http.ResponseWriter, status int, code, msg, hint string) {

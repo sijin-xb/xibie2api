@@ -30,11 +30,12 @@ func (r *recordingRenderer) renderStream(w http.ResponseWriter, _ io.Reader,
 	return nil
 }
 
-func (r *recordingRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) {
+func (r *recordingRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) bool {
 	r.nonStreamResp = resp
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("CUSTOM_OK"))
+	return true
 }
 
 func (r *recordingRenderer) renderError(w http.ResponseWriter, status int, code, msg, hint string) {

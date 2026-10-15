@@ -183,7 +183,16 @@ func AggregateObserved(r io.Reader, onErrorFrame func(payload string)) (map[stri
 						created = v
 					}
 					if u, ok := chunk["usage"].(map[string]any); ok {
-						usage = u
+						// 按 key 合并而非整表替换：上游可能在不同帧分别下发
+						// prompt_tokens 与 completion_tokens（末帧常只带后者）。
+						// 整表替换会丢掉前帧已知的 prompt_tokens / 缓存字段，
+						// 使下游上下文占用与命中率归零（同 0fc7e9f 的症状）。
+						if usage == nil {
+							usage = map[string]any{}
+						}
+						for k, v := range u {
+							usage[k] = v
+						}
 					}
 					if ch, ok := chunk["choices"].([]any); ok {
 						for _, ci := range ch {
@@ -364,9 +373,50 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 //     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
 //     而对空串，`??` 会误判为重设并清空工具名。
 //
+// toolCallNameState 收敛 name 所需的每流跨帧状态（**每流一个实例**，不可跨流共享）。
+type toolCallNameState struct {
+	seen    map[int]bool // index → 已发过首片
+	idIndex map[string]int
+	lastIdx int
+	seq     int
+}
+
+func newToolCallNameState() *toolCallNameState {
+	return &toolCallNameState{seen: map[int]bool{}, idIndex: map[string]int{}}
+}
+
+// nextIdx 分配下一个不冲突的缺 index 序号。
+func (s *toolCallNameState) nextIdx() int {
+	for {
+		idx := s.seq
+		s.seq++
+		if !s.seen[idx] {
+			return idx
+		}
+	}
+}
+
+// stripToolCallNames 收敛流式 tool_calls 的 name 语义为「每个 index 只出现一次」：
+// 首片保留 function.name，同一 index 后续分片里的 name 键一律删除（无论上游是
+// 空串还是重复非空串）。这是 OpenAI 官方流的真实形态——首帧带 name，后续帧只带
+// arguments 片段、不再出现 name 键——因此是累加型与覆盖型客户端的共同祖先行为。
+//
+// 两类消费模型在该形态下同时正确：
+//   - 累加型（官方 WorkBuddy/CodeBuddy `name += tc_function?.name || ""`）：
+//     后续分片 name 键缺失 → 追加空串，累积 name 保持唯一，不再拼成 Bash×帧数（issue #82）。
+//   - 覆盖型（hawklithm#2 / Grok Build `name ?? state.name` 或 `if (name) state.name = name`）：
+//     后续分片 name 键缺失 → 保留已建好的首帧 name，不被空串意外清空。
+//     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
+//     而对空串，`??` 会误判为重设并清空工具名。
+//
 // seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
 // 只动 function.name 键，id/type/arguments 原样透传。
-func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+//
+// 缺 index 的并行调用：部分上游省略 index。此时**不能**一律归 0——否则同一流里
+// 第二个调用的首片会被当成「index 0 的后续分片」而删掉 name（调用彻底丢失）。
+// 与 Aggregate 的 mergeToolCallsChunk 同口径：优先用 id 归位，无 id 时延续最近
+// 一个已开调用（碎片），仍无则开新序号。
+func stripToolCallNames(obj map[string]any, st *toolCallNameState) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -383,11 +433,26 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if tc == nil {
 				continue
 			}
-			idx := 0
+			idx, hasIdx := 0, false
 			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
+				idx, hasIdx = int(v), true
 			}
-			if seen[idx] {
+			if !hasIdx {
+				if cid, _ := tc["id"].(string); cid != "" {
+					if m, ok := st.idIndex[cid]; ok {
+						idx = m
+					} else {
+						idx = st.nextIdx()
+						st.idIndex[cid] = idx
+					}
+				} else if st.lastIdx >= 0 || len(st.seen) > 0 {
+					idx = st.lastIdx
+				} else {
+					idx = st.nextIdx()
+				}
+			}
+			st.lastIdx = idx
+			if st.seen[idx] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
 				if fn, _ := tc["function"].(map[string]any); fn != nil {
 					delete(fn, "name")
@@ -396,7 +461,7 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			}
 			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
 			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[idx] = true
+			st.seen[idx] = true
 		}
 	}
 }

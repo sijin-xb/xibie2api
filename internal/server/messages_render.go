@@ -46,14 +46,16 @@ func (r messagesRenderer) renderStream(w http.ResponseWriter, stats io.Reader,
 }
 
 // renderNonStream 把聚合后的 OpenAI chat.completion 转换为 Anthropic 消息写出。
-// 工具参数非法 JSON → 502 api_error（不伪造 input）。
-func (r messagesRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) {
+// 工具参数非法 JSON → 502 api_error（不伪造 input），返回 false 让调用方知道本跳
+// 未成功产出（不得记账号成功）。
+func (r messagesRenderer) renderNonStream(w http.ResponseWriter, resp map[string]any) bool {
 	obj, err := messagesFromAggregate(resp, r.meta)
 	if err != nil {
 		writeMessagesError(w, http.StatusBadGateway, "api_error", err.Error())
-		return
+		return false
 	}
 	writeJSON(w, http.StatusOK, obj)
+	return true
 }
 
 // renderError 写出终态错误（Anthropic 信封）。Anthropic 无 gateway_hint 字段，hint

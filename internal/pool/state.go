@@ -92,6 +92,11 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 连败降权也要清：Revive 语义是「无条件恢复」，而 NoteSuccess 会清这两项、
+	// Revive 此前漏了——降权中的号被人工解冻/重新登录后仍被 healthy() 挡在池外
+	// 最长 degradeCooldownMax（2h），与「人工恢复」口径矛盾。
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 	p.dirty.Store(true)
 	return true
 }
@@ -393,7 +398,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(e.a.UID, e.a.NicknameValue()), model, e.credits, p.creditFloor)
 		return nil
 	}
 	if p.inFlightFull(e) {
@@ -548,7 +553,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.Nickname,
+		Nickname:                 e.a.NicknameValue(),
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,

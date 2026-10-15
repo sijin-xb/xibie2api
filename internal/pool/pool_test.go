@@ -792,8 +792,18 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
 	}
+	// 已有有效硬冷却时，后到的软冷却**不覆盖**它：余额耗尽是主导事实（次日 04:00
+	// 签到前该号不可能服务任何请求），且 pickEarliestExpiryLocked 靠 coolKind==CoolHard
+	// 排除「必 402 的号」——被软冷却顶掉后该判据失效，号会被捞回兜底撞 402。
+	// 故此处断言硬冷却保留（kind 仍为 hard_credit、截止仍指向次日 04:00）。
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	st, _ := p.Status("u1")
+	if st.CoolKind != "hard_credit" {
+		t.Fatalf("soft cooldown must not override active hard cooldown, got kind=%q", st.CoolKind)
+	}
+	if !st.Cooling {
+		t.Fatal("hard cooldown should still be active")
+	}
 }
 
 func TestSoftStreakPersistsAcrossReload(t *testing.T) {

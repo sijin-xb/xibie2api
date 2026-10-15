@@ -48,9 +48,9 @@ func PumpFrames(r io.Reader, sink FrameSink, opts ...StreamOption) error {
 // pumpFrames 是协议无关的帧处理主循环：拥有 toolCallSeen/firstID/maxToolIdx/
 // synthIdx/toolFinishSent/repair 等全部跨帧状态，把结果经 sink 交付。
 func pumpFrames(r io.Reader, sink FrameSink, o streamOptions) error {
-	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
-	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
-	toolCallSeen := map[int]bool{}
+	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index（含缺 index 的
+	// id 归位状态），供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
+	toolCallSeen := newToolCallNameState()
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧

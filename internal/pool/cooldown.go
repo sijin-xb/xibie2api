@@ -28,11 +28,13 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	}
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
-	p.mu.RUnlock()
 	if !ok {
+		p.mu.RUnlock()
 		return false
 	}
+	// 在 RLock 内取指针：e.a 由 upsertLocked 在写锁内替换，锁外读 e.a 与它构成竞争。
 	a := e.a
+	p.mu.RUnlock()
 	a.Lock()
 	changed := a.Nickname != nickname
 	if changed {
@@ -124,7 +126,20 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.until = time.Now().Add(d)
+		now := time.Now()
+		// 已有**有效**硬冷却（余额耗尽，等签到恢复）不得被后到的软冷却覆盖：否则
+		// pickEarliestExpiryLocked 靠 coolKind==CoolHard 排除「必 402 的号」的判据失效，
+		// 该号被重新捞回全冷却兜底 → 浪费一轮轮换 + 402 噪音。硬冷却只能由
+		// NoteSuccess/余额恢复（reviveCoolingLocked）或更长时长覆盖。
+		if e.coolKind == CoolHard && now.Before(e.until) && kind != CoolHard {
+			p.dirty.Store(true)
+			return
+		}
+		// 同类冷却不缩短：新截止早于既有截止时保留既有（更长者胜）。
+		if kind == e.coolKind && now.Before(e.until) && now.Add(d).Before(e.until) {
+			return
+		}
+		e.until = now.Add(d)
 		e.coolKind = kind
 		e.reason = reason
 		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
@@ -240,6 +255,10 @@ const (
 // 无此模型、重试无意义，只能换模型/换账号」。resetAt 无需传（11102 无重置文案），
 // ResetAt 保持零值，与 6004 台账共用 Until 判定——11102 条目会以 11102 reason 出现在
 // /status 台账，运维可见。
+//
+// 不覆盖既有**真实 6004 条目**（同 BlockModelClear / RecordModelRateLimitAudit 的纪律）：
+// 6004 有上游权威重置墙钟，若被 11102 的退避 TTL 顶掉，模型避让会被无端延长数小时
+// 且丢掉 ResetAt。已有未到期的非 11102 条目时只累加 Hits、不改 Until/Reason。
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
@@ -251,6 +270,16 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
+	if e.modelCooldowns != nil {
+		if prev, ok := e.modelCooldowns[model]; ok && !prev.AuditOnly &&
+			now.Before(prev.Until) && !strings.HasPrefix(prev.Reason, modelBlockReasonPrefix) {
+			// 已有未到期的真实 6004 条目：保留其 Until/ResetAt/Reason，只累加 Hits。
+			prev.Hits++
+			e.modelCooldowns[model] = prev
+			p.dirty.Store(true)
+			return
+		}
+	}
 	hits := 0
 	if e.modelCooldowns != nil {
 		hits = e.modelCooldowns[model].Hits
@@ -272,6 +301,10 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	}
 	p.dirty.Store(true)
 }
+
+// modelBlockReasonPrefix 11102 负缓存条目的 reason 前缀（与 upstream.BlockModelReason
+// 同值）。用于区分 11102 条目与真实 6004 条目。
+const modelBlockReasonPrefix = "11102"
 
 // BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测
 // 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立
@@ -376,8 +409,20 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
+		// 已有有效硬冷却（余额耗尽，等签到）不得被软冷却覆盖：见 Cooldown 的同款理由
+		// （pickEarliestExpiryLocked 靠 coolKind==CoolHard 排除必 402 的号）。
+		if e.coolKind == CoolHard && now.Before(e.until) {
+			p.dirty.Store(true)
+			return
+		}
 		if !resetAt.IsZero() {
-			e.until = p.cappedSoftUntilLocked(now, resetAt)
+			next := p.cappedSoftUntilLocked(now, resetAt)
+			// 不缩短既有有效软冷却（更长者胜）：避免把 2h 的 WAF 退避砍到 5min，
+			// 提前重开撞墙窗口。
+			if e.coolKind == CoolSoft && now.Before(e.until) && next.Before(e.until) {
+				return
+			}
+			e.until = next
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 			d := p.softDurationLocked(base, e.softStreak+1)
@@ -393,14 +438,18 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 
 // UndoSoftRateCooldown 撤销一次**误记的账号级软冷却**，仅在判定该 429 属网关共享维度
 // （出口 IP/设备指纹）限流、而非该账号超速时调用（server.rateIPGate 激活时的回溯撤销）。
-// 撤销条件从严——仅清「非 6004、无模型豁免、且未过熔断/禁用」的账号级软冷却，避免误伤：
+// 撤销条件从严——仅清「reason 确为 429 共享维度限流、且非 6004、无模型豁免、未过熔断/禁用」
+// 的账号级软冷却，避免误伤：
 //   - coolKind != CoolSoft：非软冷却（硬冷却/熔断）不动；
 //   - until 已过期：无冷却可撤；
+//   - reason 不以 "429 rate limit" 开头：该冷却来自 WAF 403 / upstream 404 / 账号故障
+//     等**非共享维度**成因（rateIPGate 判定窗内的每个 uid 都调本函数，但它们并不都持有
+//     本次误记的 429 冷却）——清掉会让账号提前回池继续撞墙；
 //   - 存在非 AuditOnly 的 modelCooldowns：该账号另有真实模型级冷却（6004/11102），
 //     账号级软冷却不是本入口误记的那次，保留；
 //   - disabled/paused：由其他运维状态主导，不动其 until。
 //
-// 撤销时同步回退 softStreak（若因本次误记被推进）与清空 reason/until。返回是否实际撤销。
+// 撤销时同步回退 softStreak（仅当本次确因该 429 推进过）与清空 reason/until。返回是否实际撤销。
 func (p *Pool) UndoSoftRateCooldown(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -414,6 +463,9 @@ func (p *Pool) UndoSoftRateCooldown(uid string) bool {
 	}
 	if e.disabled || e.paused {
 		return false
+	}
+	if !strings.HasPrefix(e.reason, sharedRateReasonPrefix) {
+		return false // 冷却成因不是共享维度 429（WAF/404/账号故障）：不是本次误记，保留
 	}
 	for _, mc := range e.modelCooldowns {
 		if !mc.AuditOnly {
@@ -429,6 +481,11 @@ func (p *Pool) UndoSoftRateCooldown(uid string) bool {
 	p.dirty.Store(true)
 	return true
 }
+
+// sharedRateReasonPrefix 共享维度 429 软冷却的 reason 前缀。handler 记此类冷却时
+// 用的 reason 恒以 "429 rate limit" 开头（含 "(retry-after)" 变体）；WAF/404/账号
+// 故障的 reason 各有其前缀，UndoSoftRateCooldown 据此只撤本次误记的那一类。
+const sharedRateReasonPrefix = "429 rate limit"
 
 // cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
 // 取较早者）。resetAt 已过期（时钟偏移/文案过期）时时长钳到时间零点附近，立即恢复。

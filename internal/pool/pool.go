@@ -16,6 +16,9 @@ type Pool struct {
 	byUID   map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
+	// orphanInFlight 记录被 Remove 删除、但仍有在途请求的条目计数（uid → 在途数）。
+	// 同 uid 重新导入时由 upsertLocked 接管，避免在途少计导致超发。运行态，不持久化。
+	orphanInFlight map[string]int64
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -371,6 +374,15 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	if !ok {
 		return nil
 	}
+	// 暂存在途计数：条目删除后旧请求的 Release(uid) 会 no-op（byUID 查不到），
+	// 但若随后同 uid 被重新导入（Add），新条目必须接管这批在途名额——否则计数
+	// 归零而实际仍有请求在途，inFlightFull 失效导致超发。
+	if n := e.inFlight.Load(); n > 0 {
+		if p.orphanInFlight == nil {
+			p.orphanInFlight = map[string]int64{}
+		}
+		p.orphanInFlight[uid] = n
+	}
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
 	p.saveLocked()
@@ -384,7 +396,15 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	e := &entry{a: a}
+	// 接管被 Remove 暂存的在途计数：Remove 删除条目时若仍有在途请求，其计数暂存于
+	// orphanInFlight，重建时归还——否则旧请求的 Release(uid) 会扣到新条目上，
+	// 造成在途少计 → 超发（limit=1 也能并发 2 个）。
+	if n, ok := p.orphanInFlight[a.UID]; ok {
+		e.inFlight.Store(n)
+		delete(p.orphanInFlight, a.UID)
+	}
+	p.byUID[a.UID] = e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

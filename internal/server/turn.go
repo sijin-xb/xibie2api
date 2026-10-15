@@ -484,7 +484,18 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 		if st.hasCache {
 			cacheMissWarn.noteCacheTokens(p.bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
 		}
-		p.renderer.renderNonStream(w, resp)
+		rendered := p.renderer.renderNonStream(w, resp)
+		if !rendered {
+			// 渲染层转换失败（如 Anthropic 路径工具参数非法 JSON → 502）：本跳没有
+			// 产出可用响应，**不得**记账号成功、清 11102 负缓存或绑粘性——否则坏响应
+			// 会被洗白成健康跳，粘性还会把会话钉在产出坏响应的号上。
+			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeStreamError
+			h.cfg.Pool.NoteFailures(acct.UID)
+			log.Printf("WARN: [server] non-stream model=%s: render failed, account not marked success",
+				p.bareModel)
+			return
+		}
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
