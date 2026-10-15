@@ -46,7 +46,9 @@ type Snapshot struct {
 	RequestsInFlight  int64
 	RequestsSucceeded int64
 	RequestsFailed    int64
-	RequestAvgSeconds float64
+	// RequestsRateLimited 上游 429（网关最终回给客户端的 429）计数。
+	RequestsRateLimited int64
+	RequestAvgSeconds   float64
 
 	TokensPrompt     int64
 	TokensCompletion int64
@@ -124,6 +126,9 @@ func Write(w io.Writer, s Snapshot) error {
 		[]label{{"outcome", "succeeded"}}, float64(s.RequestsSucceeded))
 	e.counter("workbuddy_requests_total", "Completed requests by outcome.",
 		[]label{{"outcome", "failed"}}, float64(s.RequestsFailed))
+	// 上游 429 计数：观察出口 IP 共享维度限流的真实频率，判断是否需要多出口。
+	e.counter("workbuddy_requests_total", "Completed requests by outcome.",
+		[]label{{"outcome", "rate_limited"}}, float64(s.RequestsRateLimited))
 	e.gauge("workbuddy_request_duration_seconds_avg",
 		"Average end-to-end request duration in seconds.", nil, s.RequestAvgSeconds)
 

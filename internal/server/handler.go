@@ -305,6 +305,7 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		snap.RequestsInFlight = rs.InFlight
 		snap.RequestsSucceeded = rs.Succeeded
 		snap.RequestsFailed = rs.Failed
+		snap.RequestsRateLimited = rs.RateLimited429
 		snap.RequestAvgSeconds = rs.AvgDurationMs / 1000
 	}
 	if h.cfg.Pool != nil {

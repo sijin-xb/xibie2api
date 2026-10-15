@@ -111,11 +111,14 @@ type ArchiveStats struct {
 
 // Snapshot 一次面板读取的完整指标快照。
 type Snapshot struct {
-	StartedAt       time.Time    `json:"started_at"`
-	Completed       int64        `json:"completed"`
-	InFlight        int64        `json:"in_flight"`
-	Succeeded       int64        `json:"succeeded"`
-	Failed          int64        `json:"failed"`
+	StartedAt time.Time `json:"started_at"`
+	Completed int64     `json:"completed"`
+	InFlight  int64     `json:"in_flight"`
+	Succeeded int64     `json:"succeeded"`
+	Failed    int64     `json:"failed"`
+	// RateLimited429 上游 429 计数（网关最终回给客户端的 429）。用于观察出口 IP
+	// 共享维度限流的真实频率——判断是否需要多出口，而不是靠单次突发猜测。
+	RateLimited429  int64        `json:"rate_limited_429"`
 	SuccessRate     float64      `json:"success_rate"`
 	HTTPSuccessRate float64      `json:"http_success_rate"`
 	AvgDurationMs   float64      `json:"avg_duration_ms"`
@@ -131,6 +134,7 @@ type Recorder struct {
 	completed   int64
 	succeeded   int64
 	httpSuccess int64
+	rateLimited int64
 	durationSum int64
 	recent      []Event
 	archive     *archiveWriter
@@ -185,6 +189,9 @@ func (r *Recorder) Record(e Event) {
 	if e.Status >= 200 && e.Status < 300 {
 		r.httpSuccess++
 	}
+	if e.Status == 429 {
+		r.rateLimited++
+	}
 	r.durationSum += e.DurationMs
 	r.recent = append([]Event{e}, r.recent...)
 	if len(r.recent) > recentLimit {
@@ -203,11 +210,12 @@ func (r *Recorder) Snapshot() Snapshot {
 	}
 	r.mu.Lock()
 	s := Snapshot{
-		StartedAt: r.started,
-		Completed: r.completed,
-		InFlight:  r.inFlight,
-		Succeeded: r.succeeded,
-		Recent:    append([]Event(nil), r.recent...),
+		StartedAt:      r.started,
+		Completed:      r.completed,
+		InFlight:       r.inFlight,
+		Succeeded:      r.succeeded,
+		RateLimited429: r.rateLimited,
+		Recent:         append([]Event(nil), r.recent...),
 	}
 	if r.completed > 0 {
 		s.Failed = r.completed - r.succeeded

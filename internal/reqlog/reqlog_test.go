@@ -24,6 +24,10 @@ func TestRecorderMetricsAndRecent(t *testing.T) {
 	if len(s.Recent) != 2 || s.Recent[0].RequestID != "bad" || s.Recent[1].RequestID != "ok" {
 		t.Fatalf("recent = %+v, want newest first", s.Recent)
 	}
+	// 429 单独计数（观察出口共享维度限流频率用）。
+	if s.RateLimited429 != 1 {
+		t.Fatalf("rate_limited_429 = %d, want 1", s.RateLimited429)
+	}
 }
 
 func TestArchiveRotationReadAndFilter(t *testing.T) {
