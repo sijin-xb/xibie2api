@@ -1004,3 +1004,174 @@ func TestResponsesNonStreamToolCallsEndToEnd(t *testing.T) {
 		t.Fatalf("function_call=%v", fc)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 10. 思维链（reasoning item）
+// ---------------------------------------------------------------------------
+
+// respReasoningSSE：先思维链后正文，末帧 stop（上游 deepseek 系真实形态）。
+const respReasoningSSE = `data: {"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先算"}}]}
+
+data: {"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"再验算"}}]}
+
+data: {"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"答案是 4"}}]}
+
+data: {"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1753600002,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":6,"total_tokens":15}}
+
+data: [DONE]
+
+`
+
+// TestResponsesStreamReasoning 锁定：delta.reasoning_content → 独立 reasoning item，
+// 事件序列为 summary_part.added → text.delta×N → text.done → part.done → item.done，
+// 且 reasoning item 的 output_index 必须小于 message item（Responses 顺序约束）。
+func TestResponsesStreamReasoning(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, respReasoningSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","stream":true,"input":"2+2"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+
+	want := []string{
+		"response.created", "response.in_progress",
+		"response.output_item.added", "response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done", "response.reasoning_summary_part.done",
+		"response.output_item.done",
+		"response.output_item.added", "response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done", "response.content_part.done",
+		"response.output_item.done", "response.completed",
+	}
+	got := eventNames(events)
+	if len(got) != len(want) {
+		t.Fatalf("events=%v\nwant %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("event[%d]=%q want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+
+	// summary_index 恒为 0；sequence_number 单调。
+	var reasoning strings.Builder
+	for i, e := range events {
+		if n, ok := e.data["sequence_number"].(float64); !ok || int(n) != i+1 {
+			t.Fatalf("event %s sequence_number=%v want %d", e.name, e.data["sequence_number"], i+1)
+		}
+		if strings.HasPrefix(e.name, "response.reasoning_summary") {
+			if n, ok := e.data["summary_index"].(float64); !ok || n != 0 {
+				t.Fatalf("event %s summary_index=%v want 0", e.name, e.data["summary_index"])
+			}
+		}
+		if e.name == "response.reasoning_summary_text.delta" {
+			reasoning.WriteString(e.data["delta"].(string))
+		}
+	}
+	if reasoning.String() != "先算再验算" {
+		t.Fatalf("concatenated reasoning=%q want 先算再验算", reasoning.String())
+	}
+
+	completed := eventsNamed(events, "response.completed")[0].data
+	resp := completed["response"].(map[string]any)
+	output := resp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output=%v want [reasoning, message]", output)
+	}
+	rs := output[0].(map[string]any)
+	if rs["type"] != "reasoning" || rs["status"] != "completed" {
+		t.Fatalf("reasoning item=%v", rs)
+	}
+	if s := rs["summary"].([]any)[0].(map[string]any); s["type"] != "summary_text" || s["text"] != "先算再验算" {
+		t.Fatalf("reasoning summary=%v", s)
+	}
+	msg := output[1].(map[string]any)
+	if msg["type"] != "message" {
+		t.Fatalf("second item=%v want message", msg)
+	}
+	if c := msg["content"].([]any)[0].(map[string]any); c["text"] != "答案是 4" {
+		t.Fatalf("message content=%v", c)
+	}
+
+	// reasoning 的 output_index 必须小于 message 的。
+	added := eventsNamed(events, "response.output_item.added")
+	if len(added) != 2 {
+		t.Fatalf("output_item.added=%v", added)
+	}
+	ri := added[0].data["output_index"].(float64)
+	mi := added[1].data["output_index"].(float64)
+	if !(ri < mi) {
+		t.Fatalf("reasoning output_index=%v must be < message output_index=%v", ri, mi)
+	}
+}
+
+// TestResponsesNonStreamReasoning 非流式：message.reasoning_content → reasoning item。
+func TestResponsesNonStreamReasoning(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, respReasoningSSE, false)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","input":"2+2"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	obj := mustDecodeJSON(t, rec.Body.Bytes())
+	output := obj["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output=%v want [reasoning, message]", output)
+	}
+	rs := output[0].(map[string]any)
+	if rs["type"] != "reasoning" {
+		t.Fatalf("first item=%v want reasoning", rs)
+	}
+	if s := rs["summary"].([]any)[0].(map[string]any); s["text"] != "先算再验算" {
+		t.Fatalf("reasoning summary=%v", s)
+	}
+	if msg := output[1].(map[string]any); msg["type"] != "message" {
+		t.Fatalf("second item=%v want message", msg)
+	}
+}
+
+// TestResponsesReasoningOnlyNoEmptyMessage 纯思维链回合（无正文无工具）不补空
+// message item，也不退回空流兜底分支。
+func TestResponsesReasoningOnlyNoEmptyMessage(t *testing.T) {
+	const sse = `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"只有思考"}}]}
+
+data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, sse, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	for _, e := range events {
+		if e.name == "response.output_text.delta" {
+			t.Fatalf("reasoning-only turn must not emit output_text: %v", eventNames(events))
+		}
+	}
+	completed := eventsNamed(events, "response.completed")
+	if len(completed) != 1 {
+		t.Fatalf("events=%v", eventNames(events))
+	}
+	output := completed[0].data["response"].(map[string]any)["output"].([]any)
+	if len(output) != 1 || output[0].(map[string]any)["type"] != "reasoning" {
+		t.Fatalf("output=%v want single reasoning item", output)
+	}
+}

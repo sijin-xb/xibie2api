@@ -110,6 +110,14 @@ type responsesSink struct {
 	msgClosed bool
 	msgText   strings.Builder
 
+	// 思维链（上游 delta.reasoning_content）映射为独立的 reasoning item：
+	// 必须在 message item 之前，一旦正文/工具开始就结束该阶段（上游顺序如此）。
+	reasoningID     string
+	reasoningIndex  int
+	reasoningOpened bool
+	reasoningClosed bool
+	reasoningText   strings.Builder
+
 	toolCalls map[int]*responsesToolCall
 	toolOrder []int
 
@@ -126,13 +134,14 @@ type responsesSink struct {
 
 func newResponsesSink(w io.Writer, fl http.Flusher, meta responsesMeta) *responsesSink {
 	return &responsesSink{
-		w:         w,
-		fl:        fl,
-		meta:      meta,
-		respID:    "resp_" + randHex(16),
-		createdAt: time.Now().Unix(),
-		msgID:     "msg_" + randHex(16),
-		toolCalls: map[int]*responsesToolCall{},
+		w:           w,
+		fl:          fl,
+		meta:        meta,
+		respID:      "resp_" + randHex(16),
+		createdAt:   time.Now().Unix(),
+		msgID:       "msg_" + randHex(16),
+		reasoningID: "rs_" + randHex(16),
+		toolCalls:   map[int]*responsesToolCall{},
 	}
 }
 
@@ -257,6 +266,12 @@ func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 	if delta == nil {
 		return nil
 	}
+	// 思维链先于正文：同一帧内若两者都有，reasoning 必须占更小的 output_index。
+	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+		if err := s.appendReasoning(rc); err != nil {
+			return err
+		}
+	}
 	if txt, ok := delta["content"].(string); ok && txt != "" {
 		if err := s.appendText(txt); err != nil {
 			return err
@@ -273,9 +288,94 @@ func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 			}
 		}
 	}
-	// delta.reasoning_content 显式忽略：Responses 的 reasoning 输出需要独立的
-	// reasoning item（含 encrypted_content/摘要），本网关无该数据，不臆造。
 	return nil
+}
+
+// appendReasoning 累积思维链并发出 reasoning_summary_text.delta。
+// reasoning item 必须排在 message item 之前：正文一旦开始就不再接受思维链
+// （上游实测顺序如此），此时静默丢弃，绝不回退 output_index。
+func (s *responsesSink) appendReasoning(txt string) error {
+	if s.msgOpened || len(s.toolOrder) > 0 {
+		return nil
+	}
+	if err := s.openReasoning(); err != nil {
+		return err
+	}
+	s.reasoningText.WriteString(txt)
+	return s.emit("response.reasoning_summary_text.delta", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  s.reasoningIndex,
+		"summary_index": 0,
+		"delta":         txt,
+	})
+}
+
+// openReasoning 打开 reasoning item（added + summary_part.added）。
+func (s *responsesSink) openReasoning() error {
+	if s.reasoningOpened {
+		return nil
+	}
+	s.reasoningIndex = s.nextOutputIndex()
+	s.reasoningOpened = true
+	if err := s.emit("response.output_item.added", map[string]any{
+		"output_index": s.reasoningIndex,
+		"item": map[string]any{
+			"id":      s.reasoningID,
+			"type":    "reasoning",
+			"status":  "in_progress",
+			"summary": []any{},
+		},
+	}); err != nil {
+		return err
+	}
+	return s.emit("response.reasoning_summary_part.added", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  s.reasoningIndex,
+		"summary_index": 0,
+		"part":          map[string]any{"type": "summary_text", "text": ""},
+	})
+}
+
+// closeReasoning 关闭 reasoning item（summary_text.done + summary_part.done +
+// output_item.done）。
+func (s *responsesSink) closeReasoning() error {
+	if !s.reasoningOpened || s.reasoningClosed {
+		return nil
+	}
+	text := s.reasoningText.String()
+	if err := s.emit("response.reasoning_summary_text.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  s.reasoningIndex,
+		"summary_index": 0,
+		"text":          text,
+	}); err != nil {
+		return err
+	}
+	if err := s.emit("response.reasoning_summary_part.done", map[string]any{
+		"item_id":       s.reasoningID,
+		"output_index":  s.reasoningIndex,
+		"summary_index": 0,
+		"part":          map[string]any{"type": "summary_text", "text": text},
+	}); err != nil {
+		return err
+	}
+	if err := s.emit("response.output_item.done", map[string]any{
+		"output_index": s.reasoningIndex,
+		"item":         s.completedReasoningItem(),
+	}); err != nil {
+		return err
+	}
+	s.reasoningClosed = true
+	return nil
+}
+
+func (s *responsesSink) completedReasoningItem() map[string]any {
+	return map[string]any{
+		"id": s.reasoningID, "type": "reasoning", "status": "completed",
+		"summary": []any{map[string]any{
+			"type": "summary_text", "text": s.reasoningText.String(),
+		}},
+	}
 }
 
 // appendText 累积正文并在需要时打开 message item，随后发出 output_text.delta。
@@ -297,6 +397,10 @@ func (s *responsesSink) appendText(txt string) error {
 
 // openMessage 打开 assistant message item（added + content_part.added）。
 func (s *responsesSink) openMessage() error {
+	// 正文开始即思维链阶段结束：先闭合 reasoning item，保证 item 生命周期顺序闭合。
+	if err := s.closeReasoning(); err != nil {
+		return err
+	}
 	s.msgIndex = s.nextOutputIndex()
 	s.msgOpened = true
 	if err := s.emit("response.output_item.added", map[string]any{
@@ -324,6 +428,9 @@ func (s *responsesSink) openMessage() error {
 // handleToolCall 处理一个 tool_call 分片：首现打开 function_call item，随后发出
 // arguments.delta。function_call item 没有 content parts。
 func (s *responsesSink) handleToolCall(tc map[string]any) error {
+	if err := s.closeReasoning(); err != nil {
+		return err
+	}
 	idx := 0
 	if v, ok := tc["index"].(float64); ok {
 		idx = int(v)
@@ -434,7 +541,12 @@ func (s *responsesSink) Done() error {
 	if err := s.ensureStarted(); err != nil {
 		return err
 	}
-	if !s.msgOpened && len(s.toolOrder) == 0 {
+	// 先关闭 reasoning item：其 output_index 最小，事件顺序应与 item 顺序一致。
+	if err := s.closeReasoning(); err != nil {
+		return err
+	}
+	// 只有 reasoning item 的回合不再补空 message：output 非空，空 message 是噪声。
+	if !s.msgOpened && len(s.toolOrder) == 0 && !s.reasoningOpened {
 		// 空流（未打开任何 item）：仍产出一个空 message item，保证结构完整的终态。
 		if err := s.openMessage(); err != nil {
 			return err
@@ -580,6 +692,9 @@ func (s *responsesSink) finalOutput() []any {
 		item any
 	}
 	entries := make([]entry, 0, 1+len(s.toolOrder))
+	if s.reasoningOpened {
+		entries = append(entries, entry{s.reasoningIndex, s.completedReasoningItem()})
+	}
 	if s.msgOpened {
 		entries = append(entries, entry{s.msgIndex, s.completedMessageItem()})
 	}
@@ -638,10 +753,14 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 	}
 
 	content := ""
+	reasoning := ""
 	var toolCalls []map[string]any
 	if message, ok := firstMessage(resp); ok {
 		if s, ok := message["content"].(string); ok {
 			content = s
+		}
+		if s, ok := message["reasoning_content"].(string); ok {
+			reasoning = s
 		}
 		// upstream.Aggregate 在内存里把 tool_calls 存为 []map[string]any（见
 		// upstream/sse.go），JSON 解码路径才是 []any。toolCallsOf 同时接受两种形态，
@@ -649,9 +768,16 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		toolCalls = toolCallsOf(message)
 	}
 
-	output := make([]any, 0, 1+len(toolCalls))
-	// 纯工具调用回合（content 为空）不产出空 message item；否则始终产出 message item。
-	if content != "" || len(toolCalls) == 0 {
+	output := make([]any, 0, 2+len(toolCalls))
+	// reasoning item 必须排在 message item 之前（Responses 语义顺序）。
+	if reasoning != "" {
+		output = append(output, map[string]any{
+			"id": "rs_" + randHex(16), "type": "reasoning", "status": "completed",
+			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
+		})
+	}
+	// 纯工具调用 / 纯思维链回合不产出空 message item；其余始终产出 message item。
+	if content != "" || (len(toolCalls) == 0 && reasoning == "") {
 		output = append(output, map[string]any{
 			"id": "msg_" + randHex(16), "type": "message", "status": "completed", "role": "assistant",
 			"content": []any{map[string]any{
