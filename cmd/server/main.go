@@ -319,7 +319,12 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
+		// 共享维度 fail-fast 可配置（pool.rate_ip_*）：关闭后 429 一律按账号级
+		// 软冷却处理并继续轮转，不在多号命中时提前终止。
+		RateIPDisable:   cfg.Pool.RateIPDisable,
+		RateIPThreshold: cfg.Pool.RateIPThreshold,
+		RateIPWindow:    cfg.RateIPWindowDur,
+		Panel:           pn,
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,

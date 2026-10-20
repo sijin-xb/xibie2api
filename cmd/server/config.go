@@ -219,6 +219,16 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// RateIPDisable 关闭「上游 429 共享维度 fail-fast」。该门在短窗内多号命中
+		// 无恢复时刻的 429 时终止轮转（不再换号），依据是「同一出口 IP 被节流」。
+		// 实测该假设不总成立（激活期间换号仍可成功），关掉可把 MaxRotate 次换号
+		// 机会用完。默认 false = 保持既有行为。
+		RateIPDisable bool `json:"rate_ip_disable"`
+		// RateIPThreshold 共享维度激活阈值（窗内不同账号数），默认 2。
+		// 调大 → 更晚判定共享维度、轮转机会更多；单号池永不激活。
+		RateIPThreshold int `json:"rate_ip_threshold"`
+		// RateIPWindow 共享维度判定窗 + 激活时长，默认 "60s"。
+		RateIPWindow string `json:"rate_ip_window"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -287,6 +297,7 @@ type Config struct {
 	AlertConfig            alert.Config  `json:"-"`
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
+	RateIPWindowDur        time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
 	DegradeCooldownDur     time.Duration `json:"-"`
@@ -368,6 +379,8 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 共享维度 fail-fast 默认保持既有行为（开启、阈值 2、窗 60s）。
+	c.Pool.RateIPWindow = "60s"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -604,6 +617,20 @@ func (c *Config) normalize() error {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// 共享维度 fail-fast：空值回落默认 60s，非法值报错（同 soft_rate 风格）。
+	// 阈值 <=0 回落默认 2（0 作为「不设阈值」无意义）。
+	if c.Pool.RateIPWindow == "" {
+		c.Pool.RateIPWindow = "60s"
+	}
+	if c.RateIPWindowDur, err = time.ParseDuration(c.Pool.RateIPWindow); err != nil {
+		return fmt.Errorf("pool.rate_ip_window: %w", err)
+	}
+	if c.RateIPWindowDur <= 0 {
+		c.RateIPWindowDur = 60 * time.Second
+	}
+	if c.Pool.RateIPThreshold <= 0 {
+		c.Pool.RateIPThreshold = 2
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

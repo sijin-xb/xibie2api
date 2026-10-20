@@ -44,6 +44,18 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
+	// RateIPDisable 关闭「上游 429 共享维度 fail-fast」（ratelimit.go）。
+	// 该门在窗内 ≥RateIPThreshold 个不同账号命中 429 时终止轮转、不再换号，
+	// 依据是「同一出口 IP 被节流，换号也没用」。但实测（2026-10-20 15:40-15:42）
+	// 同门激活期间换号仍能成功，故提供关闭开关：关闭后 429 一律按账号级软冷却
+	// 处理并继续轮转（把 MaxRotate 次换号机会用完再放弃）。
+	RateIPDisable bool
+	// RateIPThreshold 共享维度激活阈值（不同账号数），0 = 内置 2。
+	// 调大 → 更晚判定共享维度，轮转机会更多；单号池永不激活。
+	RateIPThreshold int
+	// RateIPWindow 共享维度判定窗 + 激活时长，0 = 内置 60s。
+	RateIPWindow time.Duration
+
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
@@ -173,6 +185,9 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "passthrough"
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.rateIP.disabled = cfg.RateIPDisable
+	h.rateIP.threshold = cfg.RateIPThreshold
+	h.rateIP.window = cfg.RateIPWindow
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /v1/messages", h.withAuthMessages(h.messages))

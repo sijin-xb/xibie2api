@@ -170,3 +170,77 @@ func TestChatSingleAccount14003StillCools(t *testing.T) {
 		t.Fatalf("单号命中应保持账号级软冷却: %+v", st)
 	}
 }
+
+// TestRateIPGateDisable 关闭开关后 note 恒 false、active 恒 false——轮转永不因
+// 共享维度终止（429 回落到账号级软冷却 + 继续换号）。
+func TestRateIPGateDisable(t *testing.T) {
+	g := rateIPGate{disabled: true}
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		if g.note(uid, nil) {
+			t.Fatalf("disabled 时 %s 命中不应激活", uid)
+		}
+	}
+	if g.active() {
+		t.Fatal("disabled 时 active() 应为 false")
+	}
+}
+
+// TestRateIPGateCustomThreshold 阈值可调：阈值 3 时两个号命中不激活，第三个才激活。
+func TestRateIPGateCustomThreshold(t *testing.T) {
+	g := rateIPGate{threshold: 3}
+	if g.note("u1", nil) {
+		t.Fatal("第 1 个号不应激活")
+	}
+	if g.note("u2", nil) {
+		t.Fatal("阈值 3 时第 2 个号不应激活")
+	}
+	if !g.note("u3", nil) {
+		t.Fatal("第 3 个号应激活")
+	}
+}
+
+// TestRateIPGateCustomWindow 窗口可调：自定义短窗到期后自然解除。
+func TestRateIPGateCustomWindow(t *testing.T) {
+	g := rateIPGate{window: 20 * time.Millisecond}
+	g.note("u1", nil)
+	g.note("u2", nil)
+	if !g.active() {
+		t.Fatal("两个号命中应激活")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if g.active() {
+		t.Fatal("自定义窗口到期后应解除")
+	}
+}
+
+// TestChat429ContinuesRotatingWhenDisabled 关闭共享维度门后，两个号都 429 时
+// 轮转应把 MaxRotate 次机会用完（而非首次判定就 break），最终仍回 429。
+func TestChat429ContinuesRotatingWhenDisabled(t *testing.T) {
+	oldBackoff := rotateBackoffBase
+	rotateBackoffBase = 0
+	defer func() { rotateBackoffBase = oldBackoff }()
+
+	var hits int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		hits++
+		return http.StatusTooManyRequests, body14003, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a", AccessToken: "at-a", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "b", AccessToken: "at-b", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, SoftCooldown: 600 * time.Second,
+		RateIPDisable: true, MaxRotate: 3,
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if hits < 2 {
+		t.Fatalf("关闭共享维度后应继续换号，实际上游只被调用 %d 次", hits)
+	}
+}

@@ -39,6 +39,13 @@ type rateIPGate struct {
 	mu    sync.Mutex
 	hits  map[string]time.Time // uid → 最近一次命中时刻（判定窗内，惰性剪枝）
 	until time.Time            // 激活截止；零值 = 未激活
+	// disabled 关闭该门：note 恒返回 false，轮转永不因共享维度 fail-fast 终止。
+	// 单号池下该门本就永不激活（需 ≥2 个不同 UID），关闭只在多号池有意义。
+	disabled bool
+	// threshold 激活阈值，0 = 用 rateIPThreshold 常量。
+	threshold int
+	// window 判定窗 + 激活时长，0 = 用 rateIPWindow 变量。
+	window time.Duration
 }
 
 // note 记一次某账号的共享维度 429，返回记账后是否处于激活态（调用方据此 fail-fast
@@ -51,6 +58,17 @@ type rateIPGate struct {
 //     （打一条 WARN 供观测），对窗内各 uid 调 revoke 撤销误记冷却，清空判定窗
 //     （解除后需全新命中重新判定，不叠旧账）。
 func (g *rateIPGate) note(uid string, revoke func(uid string) bool) bool {
+	if g.disabled {
+		return false
+	}
+	win := g.window
+	if win <= 0 {
+		win = rateIPWindow
+	}
+	threshold := g.threshold
+	if threshold <= 0 {
+		threshold = rateIPThreshold
+	}
 	now := time.Now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -62,12 +80,12 @@ func (g *rateIPGate) note(uid string, revoke func(uid string) bool) bool {
 	}
 	g.hits[uid] = now
 	for u, t := range g.hits {
-		if now.Sub(t) > rateIPWindow {
+		if now.Sub(t) > win {
 			delete(g.hits, u)
 		}
 	}
-	if len(g.hits) >= rateIPThreshold {
-		g.until = now.Add(rateIPWindow)
+	if len(g.hits) >= threshold {
+		g.until = now.Add(win)
 		revoked := 0
 		if revoke != nil {
 			for u := range g.hits {
@@ -77,7 +95,7 @@ func (g *rateIPGate) note(uid string, revoke func(uid string) bool) bool {
 			}
 		}
 		log.Printf("WARN: [server] upstream 429 shared-dimension throttle: %d accounts hit within %s, rotate fail-fast until %s (revoked %d misapplied soft cooldown(s))",
-			len(g.hits), rateIPWindow, g.until.Format(time.RFC3339), revoked)
+			len(g.hits), win, g.until.Format(time.RFC3339), revoked)
 		g.hits = map[string]time.Time{}
 		return true
 	}
@@ -86,6 +104,9 @@ func (g *rateIPGate) note(uid string, revoke func(uid string) bool) bool {
 
 // active 报告共享维度限流是否激活（末端错误文案区分用）。
 func (g *rateIPGate) active() bool {
+	if g.disabled {
+		return false
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return time.Now().Before(g.until)

@@ -351,6 +351,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
 | `pool.credit_floor` | `0` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭（内置默认）；`config.example.json` 示例取 `100` 作为推荐值 |
+| `pool.rate_ip_disable` | `false` | **关闭「上游 429 共享维度 fail-fast」**。默认开启时，`rate_ip_window` 内 ≥`rate_ip_threshold` 个不同账号命中无恢复时刻的 429，判定为共享出口 IP 被节流，**终止轮转不再换号**。实测该假设不总成立（激活期间换号仍可成功），置 `true` 可让 429 一律按账号级软冷却处理并继续轮转，把 `max_rotate` 次机会用完。代价：共享出口真被限流时会把请求放大 `max_rotate` 倍 |
+| `pool.rate_ip_threshold` | `2` | 共享维度激活阈值（窗内不同账号数）。调大 → 更晚判定、轮转机会更多；单号池永不激活 |
+| `pool.rate_ip_window` | `60s` | 共享维度判定窗 + 激活时长。调小 → fail-fast 更快解除 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
