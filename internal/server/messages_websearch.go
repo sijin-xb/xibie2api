@@ -44,11 +44,9 @@ func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *tu
 			ws.query = q
 		}
 	}
-	max := ws.maxUses
-	if max <= 0 {
-		max = 5
-	}
-	results, err := c.Search(ctx, ws.query, max, ws.allowedDomains, ws.blockedDomains)
+	// max_uses caps how many times the tool may run per turn, not how many
+	// results one run returns; result count belongs to web_search.max_results.
+	results, err := c.Search(ctx, ws.query, 0, ws.allowedDomains, ws.blockedDomains)
 	if err != nil {
 		ws.err = err.Error()
 		log.Printf("WARN: [server] messages: web_search backend=%s query=%q failed: %v", c.Backend(), ws.query, err)
