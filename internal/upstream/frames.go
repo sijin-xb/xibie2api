@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 )
 
@@ -83,6 +84,10 @@ func pumpFrames(r io.Reader, sink FrameSink, o streamOptions) error {
 		// 也不让上游继续被读到（越早停越省钱）。
 		if guard != nil {
 			if txt := frameVisibleText(obj); txt != "" && guard.Observe(txt) {
+				// 误报排查用：命中时必须能复现"当时到底看到了什么"，否则无法
+				// 区分真复读与正常内容的偶发周期性。%q 保留不可见字节。
+				log.Printf("WARN: [upstream] loop guard tripped: total=%d period=%d window=%q",
+					guard.Total(), guard.Period(), guard.WindowText())
 				return ErrLoopDetected
 			}
 		}

@@ -95,6 +95,23 @@ func (g *LoopGuard) Tripped() bool { return g != nil && g.tripped }
 // Period 返回判定命中时的最小重复周期（字节）；未命中为 0。仅供日志诊断。
 func (g *LoopGuard) Period() int { return g.period }
 
+// Total 返回累计喂入的可见文本字节数（含已被窗口丢弃的前缀）。仅供日志诊断。
+func (g *LoopGuard) Total() int {
+	if g == nil {
+		return 0
+	}
+	return g.total
+}
+
+// WindowText 返回命中瞬间的尾部窗口原文。仅供日志诊断：误报排查必须看到触发
+// 判定的真实字节，否则无从区分"模型复读"与"正常内容恰巧周期性"。
+func (g *LoopGuard) WindowText() string {
+	if g == nil {
+		return ""
+	}
+	return string(g.buf)
+}
+
 // frameVisibleText 从一帧 OpenAI 形态的 chunk 里取出「可见文本」：正文 content 与
 // 推理 reasoning_content 都算——推理模型的复读通常先发生在推理里，只盯正文会漏。
 // 非 chunk 形态 / 无文本 → 返回空串（调用方跳过，不参与判定）。
