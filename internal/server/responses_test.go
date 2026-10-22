@@ -423,6 +423,59 @@ func TestResponsesStreamToolCall(t *testing.T) {
 	}
 }
 
+// Codex 依赖 item.phase 区分「回合最终回答」与「过程播报」：纯文本回合必须是
+// final_answer，否则客户端会把进度播报当正式回答。
+func TestResponsesMessagePhaseFinalAnswer(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, respTextSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	resp := eventsNamed(events, "response.completed")[0].data["response"].(map[string]any)
+	item := resp["output"].([]any)[0].(map[string]any)
+	if item["phase"] != "final_answer" {
+		t.Fatalf("phase=%v want final_answer", item["phase"])
+	}
+}
+
+// 出现工具调用的回合，正文是工具前的说明，phase 必须是 commentary。
+func TestResponsesMessagePhaseCommentaryWhenToolCalled(t *testing.T) {
+	// 正文先于工具调用出现，构造「先说明、再调工具」的真实形态。
+	const textThenToolSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"我先看看目录。\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_t1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls -la\\\"}\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	up, _ := staticRegressionUpstream(200, textThenToolSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	resp := eventsNamed(events, "response.completed")[0].data["response"].(map[string]any)
+	for _, raw := range resp["output"].([]any) {
+		item := raw.(map[string]any)
+		if item["type"] != "message" {
+			continue
+		}
+		if item["phase"] != "commentary" {
+			t.Fatalf("phase=%v want commentary", item["phase"])
+		}
+		return
+	}
+	t.Fatalf("no message item in output: %v", resp["output"])
+}
+
 // ---------------------------------------------------------------------------
 // 5. 上游 error 帧
 // ---------------------------------------------------------------------------

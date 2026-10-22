@@ -633,12 +633,23 @@ func (s *responsesSink) closeMessage() error {
 }
 
 func (s *responsesSink) completedMessageItem() map[string]any {
-	return map[string]any{
+	item := map[string]any{
 		"id": s.msgID, "type": "message", "status": "completed", "role": "assistant",
 		"content": []any{map[string]any{
 			"type": "output_text", "text": s.msgText.String(), "annotations": []any{}, "logprobs": []any{},
 		}},
 	}
+	// Codex 用 item.phase 区分「回合最终回答」与「过程播报」：最终回答取
+	// phase=final_answer，播报取 commentary。上游 chat 协议没有这个字段，
+	// 不补则所有正文都落进 phase IS NULL 兜底，进度播报被当成正式回答。
+	// 判据：本回合出现过工具调用 → 这段正文是工具前的说明，属 commentary；
+	// 纯文本回合（无任何工具）→ 这段就是收尾，属 final_answer。
+	if len(s.toolOrder) > 0 {
+		item["phase"] = "commentary"
+	} else {
+		item["phase"] = "final_answer"
+	}
+	return item
 }
 
 func (t *responsesToolCall) completedItem() map[string]any {
