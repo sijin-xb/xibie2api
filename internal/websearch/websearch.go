@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -152,16 +153,30 @@ func (c *Client) searchSearxng(ctx context.Context, query string, max int) ([]Re
 			Content       string `json:"content"`
 			PublishedDate string `json:"publishedDate"`
 		} `json:"results"`
+		UnresponsiveEngines any `json:"unresponsive_engines"`
 	}
 	if err := c.getJSON(ctx, u, nil, &out); err != nil {
 		return nil, err
 	}
+	// SearXNG 是聚合检索：多个引擎（bing + baidu + …）命中同一 URL 会重复出现。
+	// 按 URL 去重后再截断 max，否则同一页占多个名额、等效结果面变窄。
 	res := make([]Result, 0, len(out.Results))
+	seen := make(map[string]bool, len(out.Results))
 	for _, r := range out.Results {
+		if r.URL == "" || seen[r.URL] {
+			continue
+		}
+		seen[r.URL] = true
 		res = append(res, Result{URL: r.URL, Title: r.Title, Snippet: r.Content, PageAge: r.PublishedDate})
 		if len(res) >= max {
 			break
 		}
+	}
+	// 空结果 + 引擎全挂：SearXNG 此时仍回 200，静默会让「没搜到」和「引擎故障」
+	// 无法区分。打一行 WARN 供排障（unresponsive_engines 是 [engine, error] 对的
+	// 列表或字符串列表，直接 %v 原样带出）。
+	if len(res) == 0 && out.UnresponsiveEngines != nil {
+		log.Printf("WARN: [websearch] searxng: 0 results, unresponsive_engines=%v", out.UnresponsiveEngines)
 	}
 	return res, nil
 }

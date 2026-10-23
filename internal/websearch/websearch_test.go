@@ -39,6 +39,30 @@ func TestSearchSearxngRequiresBaseURL(t *testing.T) {
 	}
 }
 
+// 聚合引擎同 URL 重复出现时按 URL 去重，去重后再截断 max（否则同一页占多个名额）。
+func TestSearchSearxngDedup(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[
+			{"url":"https://same.example/1","title":"A (bing)","content":"aa"},
+			{"url":"https://same.example/1","title":"A (baidu)","content":"aa2"},
+			{"url":"https://b.example/2","title":"B","content":"bb"},
+			{"url":"https://c.example/3","title":"C","content":"cc"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{Enabled: true, Backend: "searxng", BaseURL: srv.URL, MaxResults: 5})
+	res, err := c.Search(context.Background(), "hello", 3, nil, nil)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 3 || res[0].URL != "https://same.example/1" || res[0].Title != "A (bing)" ||
+		res[1].URL != "https://b.example/2" || res[2].URL != "https://c.example/3" {
+		t.Fatalf("res=%+v want deduped 3 distinct URLs", res)
+	}
+}
+
 func TestSearchBraveHTML(t *testing.T) {
 	html := `<main><div class="snippet svelte-jmfu5f" data-pos="0" data-type="web" data-keynav="true">
 		<div class="result-body"><div class="result-wrapper"><div class="result-content">
