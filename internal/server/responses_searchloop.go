@@ -402,6 +402,7 @@ func (h *Handler) replayResponsesAggregate(w http.ResponseWriter, st *chatStat,
 		}
 		obj["output"] = append(wsItems, obj["output"].([]any)...)
 	}
+	applyReplayPhases(obj)
 	force := replayForceFollowUp(obj, meta)
 	if force {
 		obj["end_turn"] = false
@@ -441,6 +442,30 @@ func (h *Handler) replayResponsesAggregate(w http.ResponseWriter, st *chatStat,
 	_ = sink.emit("response.completed", map[string]any{"response": obj})
 	if fl != nil {
 		fl.Flush()
+	}
+}
+
+// applyReplayPhases 给回放 output 里的 message item 补 phase（与流式主管线
+// 同口径：过程播报 → commentary，其余 → final_answer）。缺 phase 的消息在
+// Codex 侧相位统计里是 null，与流式路径不一致。
+func applyReplayPhases(obj map[string]any) {
+	output, _ := obj["output"].([]any)
+	for _, raw := range output {
+		item, _ := raw.(map[string]any)
+		if item == nil || item["type"] != "message" {
+			continue
+		}
+		text := ""
+		if content, ok := item["content"].([]any); ok && len(content) > 0 {
+			if part, ok := content[0].(map[string]any); ok {
+				text, _ = part["text"].(string)
+			}
+		}
+		if classifyPendingNarration(text) {
+			item["phase"] = "commentary"
+		} else {
+			item["phase"] = "final_answer"
+		}
 	}
 }
 
