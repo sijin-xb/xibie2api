@@ -202,11 +202,170 @@ func TestNormalizeResponsesRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("reject_unsupported_item_type", func(t *testing.T) {
-		raw := `{"model":"glm-5.2","input":[{"type":"bogus"}]}`
-		_, _, err := normalizeResponsesRequest([]byte(raw))
-		if err == nil || err.param != "input" {
-			t.Fatalf("want input param error, got %+v", err)
+	// 历史 item 类型容错：客户端回放的历史（压缩项 / 检索动作 / 未知新类型）
+	// 绝不 400——否则 Codex 自动压缩后整个线程永久报错（messages 路径
+	// dropContentBlock 同一教训）。
+	t.Run("history_item_types_tolerated", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"compaction","encrypted_content":"x"},` +
+			`{"type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}},` +
+			`{"type":"context_compaction"},` +
+			`{"type":"configuration_update","reasoning":{"effort":"high"}},` +
+			`{"type":"local_shell_call","call_id":"c","status":"completed","action":{}},` +
+			`{"type":"image_generation_call","status":"completed","result":"r"},` +
+			`{"type":"tool_search_call","call_id":"t","execution":"e","arguments":{}},` +
+			`{"type":"bogus_future_item"},` +
+			`{"type":"message","role":"user","content":"hi"}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("history item types must be tolerated, got %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		if len(msgs) != 1 || msgs[0].(map[string]any)["role"] != "user" {
+			t.Fatalf("messages=%v want only the user message", msgs)
+		}
+	})
+
+	t.Run("reasoning_effort_mapped", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":"hi","reasoning":{"effort":"xhigh","summary":"detailed"}}`
+		body, meta, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		obj := mustDecodeJSON(t, body)
+		if obj["reasoning_effort"] != "xhigh" {
+			t.Fatalf("reasoning_effort=%v want xhigh", obj["reasoning_effort"])
+		}
+		if meta.reasoning == nil {
+			t.Fatal("meta.reasoning must be echoed")
+		}
+	})
+
+	t.Run("reasoning_null_and_invalid", func(t *testing.T) {
+		if _, _, err := normalizeResponsesRequest([]byte(`{"model":"m","input":"hi","reasoning":null}`)); err != nil {
+			t.Fatalf("reasoning:null must be accepted: %+v", err)
+		}
+		_, _, err := normalizeResponsesRequest([]byte(`{"model":"m","input":"hi","reasoning":"high"}`))
+		if err == nil || err.param != "reasoning" {
+			t.Fatalf("want reasoning param error, got %+v", err)
+		}
+	})
+
+	t.Run("reasoning_backfilled_to_next_tool_call", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"reasoning","summary":[{"type":"summary_text","text":"plan the edit"}]},` +
+			`{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},` +
+			`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		asst := msgs[0].(map[string]any)
+		if asst["reasoning_content"] != "plan the edit" {
+			t.Fatalf("reasoning_content=%v want summary text", asst["reasoning_content"])
+		}
+	})
+
+	t.Run("reasoning_backfill_truncated", func(t *testing.T) {
+		long := strings.Repeat("x", maxReasoningBackfill+100)
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"reasoning","summary":[{"type":"summary_text","text":"` + long + `"}]},` +
+			`{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		rc := msgs[0].(map[string]any)["reasoning_content"].(string)
+		if len(rc) != maxReasoningBackfill {
+			t.Fatalf("reasoning_content len=%d want %d", len(rc), maxReasoningBackfill)
+		}
+	})
+
+	t.Run("function_call_output_array_joins_text", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"function_call_output","call_id":"c1","output":[` +
+			`{"type":"output_text","text":"line1"},{"type":"output_text","text":"line2"},` +
+			`{"type":"image","image_url":"data:..."}]}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		tool := msgs[0].(map[string]any)
+		if tool["content"] != "line1\nline2" {
+			t.Fatalf("content=%q want joined text", tool["content"])
+		}
+	})
+
+	t.Run("parallel_tool_calls_passthrough", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":"hi","parallel_tool_calls":true}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		if obj := mustDecodeJSON(t, body); obj["parallel_tool_calls"] != true {
+			t.Fatalf("parallel_tool_calls=%v want true", obj["parallel_tool_calls"])
+		}
+	})
+
+	t.Run("agent_message_mapped_to_user", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"agent_message","author":"reviewer","recipient":"coder","content":[{"type":"input_text","text":"fix it"}]}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		msgs := mustDecodeJSON(t, body)["messages"].([]any)
+		m := msgs[0].(map[string]any)
+		if m["role"] != "user" || !strings.Contains(m["content"].(string), "fix it") ||
+			!strings.Contains(m["content"].(string), "reviewer") {
+			t.Fatalf("agent_message mapping=%v", m)
+		}
+	})
+
+	t.Run("additional_tools_merged", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":[` +
+			`{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"dynamic_f","parameters":{"type":"object"}}]},` +
+			`{"type":"message","role":"user","content":"hi"}],` +
+			`"tools":[{"type":"function","name":"static_f","parameters":{"type":"object"}}]}`
+		body, _, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		tools := mustDecodeJSON(t, body)["tools"].([]any)
+		names := map[string]bool{}
+		for _, t := range tools {
+			fn := t.(map[string]any)["function"].(map[string]any)
+			names[fn["name"].(string)] = true
+		}
+		if !names["static_f"] || !names["dynamic_f"] {
+			t.Fatalf("tools=%v want both static and dynamic", names)
+		}
+	})
+
+	t.Run("web_search_tool_detected", func(t *testing.T) {
+		raw := `{"model":"glm-5.2","input":"latest go release notes",` +
+			`"tools":[{"type":"function","name":"f","parameters":{"type":"object"}},` +
+			`{"type":"web_search","filters":{"allowed_domains":["go.dev"]}}]}`
+		body, meta, err := normalizeResponsesRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("unexpected error: %+v", err)
+		}
+		if meta.webSearch == nil {
+			t.Fatal("meta.webSearch must be set for web_search tool")
+		}
+		if meta.webSearch.query != "latest go release notes" {
+			t.Fatalf("query=%q", meta.webSearch.query)
+		}
+		if len(meta.webSearch.allowedDomains) != 1 || meta.webSearch.allowedDomains[0] != "go.dev" {
+			t.Fatalf("allowedDomains=%v", meta.webSearch.allowedDomains)
+		}
+		// web_search 是服务端工具：不进上游 tools。
+		tools := mustDecodeJSON(t, body)["tools"].([]any)
+		if len(tools) != 1 {
+			t.Fatalf("upstream tools=%v want only f", tools)
 		}
 	})
 

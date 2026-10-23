@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -25,6 +26,12 @@ import (
 // 查询串：query_mode="model"（缺省）时先用模型把用户问题提炼成一条搜索查询
 // （Anthropic 的 web_search 本就是模型决定查询词；原始中文问句直接打搜索引擎
 // 命中率很差），失败则回落到原始用户文本；query_mode="raw" 时直接用原始文本。
+//
+// TTL 缓存（webSearchCache）：agent 客户端（Codex / Claude Code）的工具循环会在
+// 同一轮里逐个工具调用重发请求——最后一条 user 消息不变、查询串相同，无缓存时
+// 一个 273 步的循环就是 273 次同查询检索。缓存键为查询原文（命中时连查询提炼的
+// 上游调用也一并省掉）；命中只回填结果（fresh=false），渲染层不再产出新的
+// web_search_call / server_tool_use 条目。
 func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *turnParams) {
 	if ws == nil {
 		return
@@ -32,11 +39,16 @@ func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *tu
 	c := h.cfg.WebSearch
 	if c == nil || !c.Enabled() {
 		ws.err = "web search is not enabled on this gateway"
-		log.Printf("WARN: [server] messages: web_search declared but gateway web_search is disabled")
+		log.Printf("WARN: [server] web_search: declared but gateway web_search is disabled")
 		return
 	}
 	if ws.query == "" {
 		ws.err = "no search query could be derived from the request"
+		return
+	}
+	if hit, ok := h.searchCache.get(ws.searchKey()); ok {
+		ws.results = hit.results
+		ws.err = hit.err
 		return
 	}
 	if p != nil && h.cfg.WebSearchQueryMode == "model" {
@@ -49,11 +61,78 @@ func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *tu
 	results, err := c.Search(ctx, ws.query, 0, ws.allowedDomains, ws.blockedDomains)
 	if err != nil {
 		ws.err = err.Error()
-		log.Printf("WARN: [server] messages: web_search backend=%s query=%q failed: %v", c.Backend(), ws.query, err)
+		ws.fresh = true
+		h.searchCache.put(ws.searchKey(), nil, ws.err)
+		log.Printf("WARN: [server] web_search: backend=%s query=%q failed: %v", c.Backend(), ws.query, err)
 		return
 	}
 	ws.results = results
-	log.Printf("INFO: [server] messages: web_search backend=%s query=%q results=%d", c.Backend(), ws.query, len(results))
+	ws.fresh = true
+	h.searchCache.put(ws.searchKey(), results, "")
+	log.Printf("INFO: [server] web_search: backend=%s query=%q results=%d", c.Backend(), ws.query, len(results))
+}
+
+// searchKey 缓存键：查询原文 + 域过滤（过滤不同则结果不同）。用提炼前的原文做键，
+// 命中时连带跳过查询提炼；域过滤拼进键防止串味。
+func (ws *messagesWebSearch) searchKey() string {
+	return ws.query + "\x00" + strings.Join(ws.allowedDomains, ",") + "\x00" + strings.Join(ws.blockedDomains, ",")
+}
+
+// webSearchCacheEntry 一条缓存结果（err 非空 = 上次检索失败，同样缓存以防风暴）。
+type webSearchCacheEntry struct {
+	results []websearch.Result
+	err     string
+	expires time.Time
+}
+
+// webSearchCache 查询级 TTL 缓存（容量上限防无界增长；简单整表淘汰即可——
+// 命中率场景是「同轮重复」，不需要 LRU）。
+type webSearchCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	maxKeys int
+	entries map[string]webSearchCacheEntry
+}
+
+func newWebSearchCache(ttl time.Duration, maxKeys int) webSearchCache {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if maxKeys <= 0 {
+		maxKeys = 64
+	}
+	return webSearchCache{ttl: ttl, maxKeys: maxKeys, entries: map[string]webSearchCacheEntry{}}
+}
+
+func (c *webSearchCache) get(key string) (webSearchCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok || time.Now().After(e.expires) {
+		if ok {
+			delete(c.entries, key)
+		}
+		return webSearchCacheEntry{}, false
+	}
+	return e, true
+}
+
+func (c *webSearchCache) put(key string, results []websearch.Result, err string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= c.maxKeys {
+		now := time.Now()
+		for k, e := range c.entries {
+			if now.After(e.expires) {
+				delete(c.entries, k)
+			}
+		}
+		// 过期清扫后仍满：整表淘汰（重建成本低于 LRU 复杂度）。
+		if len(c.entries) >= c.maxKeys {
+			c.entries = map[string]webSearchCacheEntry{}
+		}
+	}
+	c.entries[key] = webSearchCacheEntry{results: results, err: err, expires: time.Now().Add(c.ttl)}
 }
 
 // searchQuerySystemPrompt 查询提炼提示词：让模型输出一条搜索引擎友好的查询串。

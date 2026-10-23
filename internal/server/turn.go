@@ -46,6 +46,8 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 	degraded := p.degraded
 	tried := map[string]bool{}
 	var lastErr error
+	// promptTrimmed：11115 超限中段裁剪只做一次（裁后仍超限 = 确定性透传 400）。
+	promptTrimmed := false
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
@@ -234,13 +236,23 @@ func (h *Handler) runTurn(ctx context.Context, w http.ResponseWriter, st *chatSt
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
-			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
-			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
-			// applyErrorPolicy ErrPromptTooLong 分支零动作，fail 只释放租约。
-			// message 装上游 body 原文（含真实 token 数与上限值——上游原文是最有价值
-			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+			// 11115「prompt is too long」：先做一次服务端中段裁剪重试（见 prompt_trim.go
+			// ——Codex 长会话撞线后每个后续请求都重发同一份超长历史，直接 400 等于
+			// 判线程死刑）；裁不动或裁后仍超限才透传 400。超限与账号无关：
+			// **不罚号**；重试不消耗该号的 tried 名额（delete），也不解绑粘性
+			// （fail 只在终态透传分支调用）。
 			if kind == upstream.ErrPromptTooLong {
+				if !promptTrimmed {
+					if trimmed, ok := trimPromptOverflow(body, string(respBody)); ok {
+						promptTrimmed = true
+						body = trimmed
+						delete(tried, acct.UID)
+						releaseHeld()
+						log.Printf("WARN: [server] prompt_too_long acct=%s model=%s: history trimmed, retrying once in-turn",
+							logfmt.Label(acct.UID, acct.Nickname), p.bareModel)
+						continue
+					}
+				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), p.bareModel, uerr)
 				fail(acct.UID)
 				p.renderer.renderError(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),

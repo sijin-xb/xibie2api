@@ -122,6 +122,13 @@ type responsesSink struct {
 	reasoningClosed bool
 	reasoningText   strings.Builder
 
+	// web_search_call item（网关服务端检索的动作回执）：fresh 检索在首个输出
+	// item 之前发出，Codex 据此在 UI 展示「已联网搜索」。output_index 最小。
+	searchID      string
+	searchIndex   int
+	searchEmitted bool
+	searchQuery   string
+
 	toolCalls map[int]*responsesToolCall
 	toolOrder []int
 
@@ -142,7 +149,7 @@ type responsesMessageItem struct {
 }
 
 func newResponsesSink(w io.Writer, fl http.Flusher, meta responsesMeta) *responsesSink {
-	return &responsesSink{
+	s := &responsesSink{
 		w:           w,
 		fl:          fl,
 		meta:        meta,
@@ -152,6 +159,10 @@ func newResponsesSink(w io.Writer, fl http.Flusher, meta responsesMeta) *respons
 		reasoningID: "rs_" + randHex(16),
 		toolCalls:   map[int]*responsesToolCall{},
 	}
+	if meta.webSearch != nil {
+		s.searchQuery = meta.webSearch.query
+	}
+	return s
 }
 
 // emit 写一条 SSE 事件：event: <name>\ndata: <json>\n\n，data 内附 type + 单调
@@ -173,7 +184,8 @@ func (s *responsesSink) emit(event string, data map[string]any) error {
 	return nil
 }
 
-// ensureStarted 惰性发出 response.created + response.in_progress（仅一次）。
+// ensureStarted 惰性发出 response.created + response.in_progress（仅一次），随后
+// 若本次是 fresh 检索，先发出 web_search_call item（output_index 0，先于一切输出）。
 func (s *responsesSink) ensureStarted() error {
 	if s.started {
 		return nil
@@ -182,7 +194,45 @@ func (s *responsesSink) ensureStarted() error {
 	if err := s.emit("response.created", map[string]any{"response": s.responseObject("in_progress", false)}); err != nil {
 		return err
 	}
-	return s.emit("response.in_progress", map[string]any{"response": s.responseObject("in_progress", false)})
+	if err := s.emit("response.in_progress", map[string]any{"response": s.responseObject("in_progress", false)}); err != nil {
+		return err
+	}
+	return s.emitWebSearchCall()
+}
+
+// emitWebSearchCall 发出 web_search_call item（added → done 生命周期）。检索在
+// 出站前已完成，done 直接 completed。仅 fresh 检索发出；TTL 缓存命中（同轮重复
+// 请求）不重复发。查询串缺失（提炼失败回落空）时退化为无 action 形态。
+func (s *responsesSink) emitWebSearchCall() error {
+	if s.searchEmitted || s.meta.webSearch == nil || !s.meta.webSearch.fresh {
+		return nil
+	}
+	s.searchEmitted = true
+	s.searchID = "ws_" + randHex(16)
+	s.searchIndex = s.nextOutputIndex()
+	added := map[string]any{
+		"id":     s.searchID,
+		"type":   "web_search_call",
+		"status": "in_progress",
+	}
+	if err := s.emit("response.output_item.added", map[string]any{
+		"output_index": s.searchIndex,
+		"item":         added,
+	}); err != nil {
+		return err
+	}
+	done := map[string]any{
+		"id":     s.searchID,
+		"type":   "web_search_call",
+		"status": "completed",
+	}
+	if s.searchQuery != "" {
+		done["action"] = map[string]any{"type": "search", "query": s.searchQuery}
+	}
+	return s.emit("response.output_item.done", map[string]any{
+		"output_index": s.searchIndex,
+		"item":         done,
+	})
 }
 
 // responseObject 构造 Responses 响应对象；completed=true 时填 completed_at。
@@ -204,6 +254,7 @@ func (s *responsesSink) responseObject(status string, completed bool) map[string
 		"previous_response_id": nil,
 		"instructions":         s.meta.instructions,
 		"metadata":             s.meta.metadata,
+		"reasoning":            s.meta.reasoning,
 		"error":                nil,
 		"incomplete_details":   nil,
 		"usage":                nil,
@@ -420,6 +471,17 @@ func (s *responsesSink) completedReasoningItem() map[string]any {
 			"type": "summary_text", "text": s.reasoningText.String(),
 		}},
 	}
+}
+
+// completedWebSearchItem 终态 output 里的 web_search_call item（与流式 done 事件同形）。
+func (s *responsesSink) completedWebSearchItem() map[string]any {
+	item := map[string]any{
+		"id": s.searchID, "type": "web_search_call", "status": "completed",
+	}
+	if s.searchQuery != "" {
+		item["action"] = map[string]any{"type": "search", "query": s.searchQuery}
+	}
+	return item
 }
 
 // appendText 暂存正文，直到工具边界或流尾确定 phase。
@@ -801,6 +863,9 @@ func (s *responsesSink) finalOutput() []any {
 		item any
 	}
 	entries := make([]entry, 0, 1+len(s.toolOrder)+len(s.msgItems))
+	if s.searchEmitted {
+		entries = append(entries, entry{s.searchIndex, s.completedWebSearchItem()})
+	}
 	if s.reasoningOpened {
 		entries = append(entries, entry{s.reasoningIndex, s.completedReasoningItem()})
 	}
@@ -859,6 +924,7 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		"previous_response_id": nil,
 		"instructions":         meta.instructions,
 		"metadata":             meta.metadata,
+		"reasoning":            meta.reasoning,
 		"error":                nil,
 		"incomplete_details":   nil,
 		"usage":                nil,
@@ -886,6 +952,14 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 	}
 
 	output := make([]any, 0, 2+len(toolCalls))
+	// web_search_call（fresh 检索的动作回执）排在最前，与流式路径 output_index 语义一致。
+	if meta.webSearch != nil && meta.webSearch.fresh {
+		item := map[string]any{"id": "ws_" + randHex(16), "type": "web_search_call", "status": "completed"}
+		if meta.webSearch.query != "" {
+			item["action"] = map[string]any{"type": "search", "query": meta.webSearch.query}
+		}
+		output = append(output, item)
+	}
 	// reasoning item 必须排在 message item 之前（Responses 语义顺序）。
 	if reasoning != "" {
 		output = append(output, map[string]any{

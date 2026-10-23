@@ -59,9 +59,10 @@ type messagesWebSearch struct {
 	maxUses        int
 	allowedDomains []string
 	blockedDomains []string
-	query          string // 从最后一条 user 消息提取的查询串
+	query          string // 从最后一条 user 消息提取的查询串（runWebSearch 前为原文）
 	results        []websearch.Result
 	err            string // 非空 = 检索失败（渲染为 web_search_tool_result_error）
+	fresh          bool   // 本次真实执行了检索（false = TTL 缓存命中）；渲染层据此决定是否产出 web_search_call item
 }
 
 // messagesError 归一化/读体阶段的请求级错误（映射为 Anthropic 错误信封）。

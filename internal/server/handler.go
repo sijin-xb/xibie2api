@@ -168,6 +168,9 @@ type Handler struct {
 	// ratelimit.go）：短窗多号命中无恢复时刻的账号级 429 → 跳过逐号软冷却并终止
 	// 轮转。进程内状态、重启清零。
 	rateIP rateIPGate
+	// searchCache web_search 服务端工具的查询级 TTL 缓存（messages_websearch.go）：
+	// agent 客户端工具循环内同轮重复请求不再重复检索。
+	searchCache webSearchCache
 }
 
 // NewHandler 构建 handler。
@@ -191,6 +194,7 @@ func NewHandler(cfg Config) *Handler {
 	h.rateIP.disabled = cfg.RateIPDisable
 	h.rateIP.threshold = cfg.RateIPThreshold
 	h.rateIP.window = cfg.RateIPWindow
+	h.searchCache = newWebSearchCache(10*time.Minute, 64)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /v1/messages", h.withAuthMessages(h.messages))

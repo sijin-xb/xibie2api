@@ -245,7 +245,7 @@ type Config struct {
 	// 非空时其他模型在网关本地 400 拒绝，不选号、不出站。
 	AllowedModels []string `json:"allowed_models,omitempty"`
 
-	// WebSearch web_search 服务端工具的检索后端（仅 /v1/messages 生效）。缺省关闭：
+	// WebSearch web_search 服务端工具的检索后端（/v1/messages 与 /v1/responses 均生效）。缺省关闭：
 	// 客户端声明 web_search 时回 web_search_tool_result_error。启用后网关自己执行
 	// 检索（上游 CodeBuddy 无此能力），结果回填成 Anthropic 内容块并注入出站 prompt。
 	//
@@ -738,7 +738,7 @@ func (c *Config) normalize() error {
 // normalizeWebSearch 解析并构建 web_search 检索客户端。
 //
 // 关闭（enabled=false）时 WebSearchClient 保持 nil（/v1/messages 收到 web_search
-// 声明时回 web_search_tool_result_error）。启用时校验后端与必填项（searxng 需
+// 声明时回错误）。启用时校验后端与必填项（searxng 需
 // base_url；tavily/brave 需 api_key），timeout 解析失败 fail fast。
 func (c *Config) normalizeWebSearch() error {
 	if !c.WebSearch.Enabled {

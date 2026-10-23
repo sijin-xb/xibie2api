@@ -6,9 +6,15 @@
 //   - 归一化只做「请求形态翻译」，**不**做别名 / 提示词 / 脱敏（那些在 prepareTurn 里
 //     对归一化后的 OpenAI body 执行）。归一化出的 body["model"] 必须是**原始客户端
 //     model 字符串**，这样 peek.Model / 别名 / 出站重写与 chat 路径逐字节一致。
-//   - 网关是无状态的：任何需要「服务端存储的历史响应/会话」的字段一律 **400 拒绝**，
-//     不伪造、不假装支持。已支持字段映射见下方 mapXxx；接受但不转发字段在 meta 里
-//     原样带回（回显），绝不落盘。
+//   - 网关是无状态的：任何需要「服务端存储的历史响应/会话」的**请求字段**一律
+//     **400 拒绝**（previous_response_id / conversation / truncation:"auto"），
+//     不伪造、不假装支持。
+//   - input 里的**历史 item 类型**则是另一回事：历史属于客户端（Codex 会回放压缩
+//     项 / web_search_call / 各种新 item），对未知类型逐个 400 会让**整个会话无法
+//     继续**——与 /v1/messages 路径 dropContentBlock 同一教训。可翻译的翻译
+//     （agent_message / additional_tools / reasoning），无法表达的安全丢弃并记日志。
+//   - 已支持字段映射见下方 mapXxx；接受但不转发字段在 meta 里原样带回（回显），
+//     绝不落盘。
 package server
 
 import (
@@ -32,7 +38,11 @@ type responsesMeta struct {
 	maxOutputTokens   any
 	metadata          any // 接受但不转发
 	parallelToolCalls any // 接受但不转发
+	reasoning         any // 原始 reasoning 对象（effort 已翻译进 body，此处仅回显）
 	stream            bool
+	// webSearch 非 nil = Codex 声明了 web_search 服务端工具：出站前由网关检索
+	// （见 responses 入口），渲染层据此产出 web_search_call item。
+	webSearch *messagesWebSearch
 	// toolRefs 摊平后的上游 function 名 → Responses 原始工具形态。渲染层据此把
 	// 上游 function_call 还原为 Codex 期望的 item（namespace / custom）。nil = 无需还原。
 	toolRefs map[string]responsesToolRef
@@ -77,6 +87,13 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer st.done()
+	// web_search 服务端工具（与 /v1/messages 路径同构）：Codex 声明 type:"web_search"
+	// 时由网关出站前实际检索，结果作为一条 system 消息注入 prompt，渲染层先产出
+	// 一个 web_search_call item 让 UI 可见。放在 prepareTurn 之后以复用选号/realm。
+	if meta.webSearch != nil {
+		h.runWebSearch(r.Context(), meta.webSearch, p)
+		p.body = injectSearchContext(p.body, meta.webSearch.results)
+	}
 	h.runTurn(r.Context(), w, st, p)
 }
 
@@ -160,7 +177,22 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		toolChoice = v
 	}
 
-	// metadata / parallel_tool_calls：接受但不转发（仅回显）。
+	// reasoning：可选对象 {effort, summary}。effort 翻译为上游 reasoning_effort
+	// （Codex 把推理档位放在这里；缺翻译时档位静默丢失，上游回落默认档）。
+	// summary（detailed/auto）上游无法表达，仅在 meta 回显。整个对象非 object
+	// （且非 null）按非法请求拒绝。
+	var reasoning any
+	if v, ok := root["reasoning"]; ok && v != nil {
+		obj, isObj := v.(map[string]any)
+		if !isObj {
+			return nil, responsesMeta{}, invalidResponses("reasoning", "reasoning must be an object")
+		}
+		reasoning = v
+		_ = obj // effort 的提取在 body 构造处（见下方），这里只做形态校验与回显留存
+	}
+
+	// metadata / parallel_tool_calls：metadata 接受但不转发（仅回显）；
+	// parallel_tool_calls 透传给上游（Codex 显式携带，语义与上游字段一致）。
 	var metadata any
 	if v, ok := root["metadata"]; ok {
 		metadata = v
@@ -183,17 +215,29 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 	if s, _ := instructions.(string); s != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": s})
 	}
-	inMsgs, rerr := normalizeResponsesInput(inputVal)
+	inMsgs, inState, rerr := normalizeResponsesInput(inputVal)
 	if rerr != nil {
 		return nil, responsesMeta{}, rerr
 	}
 	messages = append(messages, inMsgs...)
 
 	// tools 映射（Responses 扁平形态 → OpenAI 嵌套 function 形态）。namespace /
-	// custom 工具会被摊平为上游可表达的 function，并记录还原映射。
-	oTools, toolRefs, rerr := mapResponsesTools(tools)
+	// custom 工具会被摊平为上游可表达的 function，并记录还原映射。input 里
+	// additional_tools item 携带的带内工具声明（Codex 会话中途加载的工具）也在这里
+	// 并入同一映射。type:"web_search" 是服务端工具：不进上游 tools，转由网关检索
+	// （meta.webSearch），渲染层产出 web_search_call item。
+	declaredTools := tools
+	if len(inState.extraTools) > 0 {
+		declaredTools = append(append([]any{}, tools...), inState.extraTools...)
+	}
+	oTools, toolRefs, ws, rerr := mapResponsesTools(declaredTools)
 	if rerr != nil {
 		return nil, responsesMeta{}, rerr
+	}
+	if ws != nil {
+		// 查询串取最后一条 user 消息（与 /v1/messages 路径同构）；runWebSearch 里
+		// 会再按 query_mode 用模型提炼。
+		ws.query = lastUserText(messages)
 	}
 
 	body := map[string]any{
@@ -220,6 +264,14 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		}
 		body["tool_choice"] = mapped
 	}
+	if parallel != nil {
+		body["parallel_tool_calls"] = parallel
+	}
+	if reasoning != nil {
+		if effort, ok := reasoningEffortOf(reasoning); ok {
+			body["reasoning_effort"] = effort
+		}
+	}
 
 	out, merr := json.Marshal(body)
 	if merr != nil {
@@ -235,10 +287,23 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		maxOutputTokens:   maxOut,
 		metadata:          metadata,
 		parallelToolCalls: parallel,
+		reasoning:         reasoning,
 		stream:            stream,
+		webSearch:         ws,
 		toolRefs:          toolRefs,
 	}
 	return out, meta, nil
+}
+
+// reasoningEffortOf 从 reasoning 对象提取 effort 字段（非空字符串才返回）。
+func reasoningEffortOf(reasoning any) (string, bool) {
+	obj, ok := reasoning.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	e, _ := obj["effort"].(string)
+	e = strings.TrimSpace(e)
+	return e, e != ""
 }
 
 // rejectUnsupported 拒绝一切「需要服务端存储历史/会话」的字段（无状态网关）。
@@ -278,32 +343,54 @@ func rejectUnsupported(root map[string]any) *responsesError {
 	return nil
 }
 
+// responsesInputState 承载 input 数组归一化的跨 item 状态：
+//   - pendingReasoning：最近一个 reasoning item 的摘要文本，挂到**下一条** assistant
+//     工具调用消息的 reasoning_content 上（DeepSeek 系多轮工具链要求回传推理痕迹，
+//     payload 层 backfillReasoningContent 只补空串，真实内容在这里注入）；
+//   - extraTools：additional_tools item 带内声明的工具（Responses 形态）；
+//   - dropped：按类型计数被丢弃的 item（日志用，避免每 item 一行刷屏）。
+type responsesInputState struct {
+	pendingReasoning string
+	extraTools       []any
+	dropped          map[string]int
+}
+
+// maxReasoningBackfill 单个 reasoning 摘要回填的长度上限（字符）。摘要是 Codex 回放的
+// 历史推理概要，超长摘要回填只会推高 prompt 体积（实测长会话 196 个 item）。
+const maxReasoningBackfill = 4096
+
 // normalizeResponsesInput 把 input 归一化为 OpenAI messages 数组。
 //   - string → 单条 user 消息；
-//   - array  → 逐项归一化（reasoning 项安全忽略，返回 nil 被过滤）。
-func normalizeResponsesInput(input any) ([]any, *responsesError) {
+//   - array  → 逐项归一化；无法表达的历史 item（压缩项 / web_search_call 等）
+//     安全丢弃并计数（绝不 400，见文件头「设计纪律」）。
+func normalizeResponsesInput(input any) ([]any, *responsesInputState, *responsesError) {
+	state := &responsesInputState{}
 	switch v := input.(type) {
 	case string:
-		return []any{map[string]any{"role": "user", "content": v}}, nil
+		return []any{map[string]any{"role": "user", "content": v}}, state, nil
 	case []any:
 		msgs := make([]any, 0, len(v))
 		for i, item := range v {
-			m, rerr := normalizeResponsesItem(item, i)
+			m, rerr := normalizeResponsesItem(item, i, state)
 			if rerr != nil {
-				return nil, rerr
+				return nil, nil, rerr
 			}
 			if m != nil {
 				msgs = append(msgs, m)
 			}
 		}
-		return msgs, nil
+		for typ, n := range state.dropped {
+			log.Printf("INFO: [server] responses: dropped %d history item(s) of type %q (not expressible upstream)", n, typ)
+		}
+		return msgs, state, nil
 	default:
-		return nil, invalidResponses("input", "input must be a string or an array of items")
+		return nil, nil, invalidResponses("input", "input must be a string or an array of items")
 	}
 }
 
-// normalizeResponsesItem 归一化单个 input item；reasoning 项返回 (nil, nil) 表示忽略。
-func normalizeResponsesItem(item any, i int) (any, *responsesError) {
+// normalizeResponsesItem 归一化单个 input item。
+// 返回 (nil, nil) = 该 item 无对应消息（被忽略 / 仅记录状态）。
+func normalizeResponsesItem(item any, i int, state *responsesInputState) (any, *responsesError) {
 	obj, ok := item.(map[string]any)
 	if !ok {
 		return nil, invalidResponses("input", fmt.Sprintf("input[%d] must be an object", i))
@@ -313,19 +400,154 @@ func normalizeResponsesItem(item any, i int) (any, *responsesError) {
 	case "message":
 		return normalizeResponsesMessage(obj, i)
 	case "function_call":
-		return normalizeResponsesFunctionCall(obj, i)
+		m, rerr := normalizeResponsesFunctionCall(obj, i)
+		if rerr != nil {
+			return nil, rerr
+		}
+		attachPendingReasoning(m, state)
+		return m, nil
 	case "function_call_output":
 		return normalizeResponsesFunctionCallOutput(obj, i)
 	case "custom_tool_call":
-		return normalizeResponsesCustomToolCall(obj, i)
+		m, rerr := normalizeResponsesCustomToolCall(obj, i)
+		if rerr != nil {
+			return nil, rerr
+		}
+		attachPendingReasoning(m, state)
+		return m, nil
 	case "custom_tool_call_output":
 		return normalizeResponsesCustomToolCallOutput(obj, i)
 	case "reasoning":
-		// 安全忽略：本网关无 reasoning item 的加密内容/摘要数据，不臆造、不转发。
+		// 摘要文本进入 pendingReasoning，挂到下一条 assistant 工具调用消息
+		// （DeepSeek 多轮工具链的推理回传）；无后续工具调用时自然丢弃。
+		if txt := reasoningSummaryText(obj); txt != "" {
+			state.pendingReasoning = txt
+		}
+		return nil, nil
+	case "agent_message":
+		// 多智能体消息（author→recipient 的 input_text 列表）：按用户可见文本
+		// 转成 user 消息，保留来源标注。
+		return normalizeResponsesAgentMessage(obj, i)
+	case "additional_tools":
+		// 带内工具声明（Codex 会话中途加载的工具）：并入本轮 tools 映射。
+		if subs, ok := obj["tools"].([]any); ok && len(subs) > 0 {
+			state.extraTools = append(state.extraTools, subs...)
+		}
+		return nil, nil
+	case "web_search_call", "local_shell_call", "image_generation_call",
+		"tool_search_call", "tool_search_output",
+		"compaction", "compaction_summary", "context_compaction", "compaction_trigger",
+		"configuration_update", "ghost_snapshot":
+		// 历史动作记录 / 压缩占位 / 会话内配置变更：上游无对应形态，丢弃
+		// （压缩摘要本地路径是 user 消息形态，这里只会出现加密占位，无法解出）。
+		state.noteDropped(typ)
 		return nil, nil
 	default:
-		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: unsupported item type %q", i, typ))
+		// 未知类型（客户端版本演进出的新 item）：丢弃 + WARN。历史 item 属于
+		// 客户端，逐个 400 会让整个会话无法继续（messages 路径 dropContentBlock
+		// 同一教训）。
+		state.noteDropped(typ)
+		log.Printf("WARN: [server] responses: input[%d]: unknown item type %q dropped", i, typ)
+		return nil, nil
 	}
+}
+
+// noteDropped 计数被丢弃的 item 类型（惰性建表）。
+func (st *responsesInputState) noteDropped(typ string) {
+	if st.dropped == nil {
+		st.dropped = map[string]int{}
+	}
+	if typ == "" {
+		typ = "(missing)"
+	}
+	st.dropped[typ]++
+}
+
+// attachPendingReasoning 把 pendingReasoning 挂到 assistant 工具调用消息的
+// reasoning_content（非空时），并清空 pending（只挂一次）。
+func attachPendingReasoning(m any, state *responsesInputState) {
+	if state.pendingReasoning == "" {
+		return
+	}
+	if msg, ok := m.(map[string]any); ok {
+		msg["reasoning_content"] = state.pendingReasoning
+	}
+	state.pendingReasoning = ""
+}
+
+// reasoningSummaryText 提取 reasoning item 的可读文本：summary[].text 拼接，
+// 无 summary 时取 content[].text。截断到 maxReasoningBackfill。
+func reasoningSummaryText(obj map[string]any) string {
+	var sb strings.Builder
+	if parts, ok := obj["summary"].([]any); ok {
+		for _, p := range parts {
+			part, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if txt, ok := part["text"].(string); ok && txt != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(txt)
+			}
+		}
+	}
+	if sb.Len() == 0 {
+		if parts, ok := obj["content"].([]any); ok {
+			for _, p := range parts {
+				part, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if txt, ok := part["text"].(string); ok && txt != "" {
+					if sb.Len() > 0 {
+						sb.WriteString("\n")
+					}
+					sb.WriteString(txt)
+				}
+			}
+		}
+	}
+	txt := strings.TrimSpace(sb.String())
+	if len(txt) > maxReasoningBackfill {
+		txt = txt[:maxReasoningBackfill]
+	}
+	return txt
+}
+
+// normalizeResponsesAgentMessage 归一化 {type:"agent_message",author,recipient,
+// content:[{type:"input_text",text}]} → user 消息（保留来源标注；content 兼容纯字符串）。
+func normalizeResponsesAgentMessage(obj map[string]any, i int) (any, *responsesError) {
+	author, _ := obj["author"].(string)
+	recipient, _ := obj["recipient"].(string)
+	var texts []string
+	switch c := obj["content"].(type) {
+	case string:
+		if c != "" {
+			texts = append(texts, c)
+		}
+	case []any:
+		for _, p := range c {
+			part, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if txt, ok := part["text"].(string); ok && txt != "" {
+				texts = append(texts, txt)
+			}
+		}
+	default:
+		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: agent_message content must be a string or an array", i))
+	}
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	return map[string]any{
+		"role": "user",
+		"content": fmt.Sprintf("[message from agent %s to %s]\n%s",
+			author, recipient, strings.Join(texts, "\n")),
+	}, nil
 }
 
 // normalizeResponsesMessage 归一化 {type:"message", role, content}。
@@ -430,21 +652,52 @@ func normalizeResponsesFunctionCallOutput(obj map[string]any, i int) (any, *resp
 	if strings.TrimSpace(callID) == "" {
 		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: function_call_output.call_id is required", i))
 	}
-	var content string
-	switch out := obj["output"].(type) {
+	content, rerr := responsesOutputContent(obj["output"], "function_call_output", i)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return map[string]any{"role": "tool", "tool_call_id": callID, "content": content}, nil
+}
+
+// responsesOutputContent 归一化 *_tool_call_output 的 output 字段。Codex 新版会把
+// 工具输出编码为结构化内容项数组（[{type:"output_text"|"input_text"|..., text}]，
+// 含图片等非文本部分）：文本部分拼接，非文本部分丢弃记日志；字符串原样；对象
+// JSON 编码（既有行为）。
+func responsesOutputContent(out any, what string, i int) (string, *responsesError) {
+	switch v := out.(type) {
 	case nil:
-		content = ""
+		return "", nil
 	case string:
-		content = out
+		return v, nil
+	case []any:
+		var texts []string
+		dropped := 0
+		for _, p := range v {
+			part, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch part["type"].(string) {
+			case "output_text", "input_text", "text":
+				if txt, ok := part["text"].(string); ok && txt != "" {
+					texts = append(texts, txt)
+				}
+			default:
+				dropped++
+			}
+		}
+		if dropped > 0 {
+			log.Printf("INFO: [server] responses: input[%d]: %s.output dropped %d non-text content part(s)", i, what, dropped)
+		}
+		return strings.Join(texts, "\n"), nil
 	default:
 		b, err := json.Marshal(out)
 		if err != nil {
-			return nil, invalidResponses("input",
-				fmt.Sprintf("input[%d]: function_call_output.output could not be encoded", i))
+			return "", invalidResponses("input",
+				fmt.Sprintf("input[%d]: %s.output could not be encoded", i, what))
 		}
-		content = string(b)
+		return string(b), nil
 	}
-	return map[string]any{"role": "tool", "tool_call_id": callID, "content": content}, nil
 }
 
 // namespaceToolSeparator 摊平 namespace 工具时的连接符。上游只认扁平 function 名；
@@ -469,30 +722,48 @@ type responsesToolRef struct {
 //   - {type:"function"} → 原样嵌套（含已嵌套形态）；
 //   - {type:"namespace",name,tools} → 每个子工具摊平为 "<ns>__<tool>" function；
 //   - {type:"custom",name,format} → 单参数（input:string）function；
-//   - 其余（type:"web_search" 等上游无法表达的内置工具）→ 跳过并告警。
+//   - {type:"web_search"/"web_search_preview"} → 服务端工具：网关检索执行
+//     （meta.webSearch，入口处 runWebSearch），不进上游 tools；
+//   - 其余上游无法表达的内置工具 → 跳过并告警。
 //
 // 返回值 refs 以摊平后的上游函数名为键，渲染层据此把 function_call 还原为
-// Codex 期望的 namespace / custom item 形态。
-func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *responsesError) {
+// Codex 期望的 namespace / custom item 形态；ws 非 nil = 检出了 web_search 工具。
+func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *messagesWebSearch, *responsesError) {
 	if tools == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	out := make([]any, 0, len(tools))
 	refs := make(map[string]responsesToolRef)
+	var ws *messagesWebSearch
 	var skipped []string
 	for i, t := range tools {
 		tool, ok := t.(map[string]any)
 		if !ok {
-			return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d] must be an object", i))
+			return nil, nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d] must be an object", i))
 		}
 		typ, _ := tool["type"].(string)
 		switch typ {
 		case "function":
 			fn, rerr := mapResponsesFunctionTool(tool, i)
 			if rerr != nil {
-				return nil, nil, rerr
+				return nil, nil, nil, rerr
 			}
 			out = append(out, map[string]any{"type": "function", "function": fn})
+		case "web_search", "web_search_preview":
+			if ws == nil {
+				ws = &messagesWebSearch{}
+				if filters, ok := tool["filters"].(map[string]any); ok {
+					ws.allowedDomains = stringSlice(filters["allowed_domains"])
+					ws.blockedDomains = stringSlice(filters["blocked_domains"])
+				}
+				// 顶层形态兼容（OpenAI 规范历史版本）。
+				if len(ws.allowedDomains) == 0 {
+					ws.allowedDomains = stringSlice(tool["allowed_domains"])
+				}
+				if len(ws.blockedDomains) == 0 {
+					ws.blockedDomains = stringSlice(tool["blocked_domains"])
+				}
+			}
 		case "namespace":
 			ns, _ := tool["name"].(string)
 			subs, _ := tool["tools"].([]any)
@@ -504,7 +775,7 @@ func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *respon
 			for j, st := range subs {
 				sub, ok := st.(map[string]any)
 				if !ok {
-					return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d].tools[%d] must be an object", i, j))
+					return nil, nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d].tools[%d] must be an object", i, j))
 				}
 				if styp, _ := sub["type"].(string); styp != "function" {
 					skipped = append(skipped, "namespace/"+styp)
@@ -512,7 +783,7 @@ func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *respon
 				}
 				fn, rerr := mapResponsesFunctionTool(sub, i)
 				if rerr != nil {
-					return nil, nil, rerr
+					return nil, nil, nil, rerr
 				}
 				bare, _ := fn["name"].(string)
 				flat := flattenNamespaceTool(ns, bare)
@@ -532,7 +803,7 @@ func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *respon
 		case "custom":
 			name, _ := tool["name"].(string)
 			if strings.TrimSpace(name) == "" {
-				return nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: custom tool name is required", i))
+				return nil, nil, nil, invalidResponses("tools", fmt.Sprintf("tools[%d]: custom tool name is required", i))
 			}
 			// freeform（grammar）在上游无法表达，退化为单字符串参数 input：
 			// 模型把整段文本塞进该参数，渲染层再还原成 custom_tool_call.input。
@@ -555,15 +826,15 @@ func mapResponsesTools(tools []any) ([]any, map[string]responsesToolRef, *respon
 			out = append(out, map[string]any{"type": "function", "function": fn})
 			refs[name] = responsesToolRef{name: name, custom: true}
 		default:
-			// type:"web_search" 等上游无法表达的内置工具：搜索由服务端执行器完成，
-			// 网关无法替代。跳过并告警（不 400），否则 Codex 整体不可用。
+			// 其余上游无法表达的内置工具（local_shell 等）：跳过并告警（不 400），
+			// 否则 Codex 整体不可用。
 			skipped = append(skipped, typ)
 		}
 	}
 	if len(skipped) > 0 {
 		log.Printf("WARN: [server] responses: skipped %d tool(s) the upstream cannot express: %v", len(skipped), skipped)
 	}
-	return out, refs, nil
+	return out, refs, ws, nil
 }
 
 // mapResponsesFunctionTool 归一化单个 Responses function 工具为上游嵌套 function 形态。
@@ -626,19 +897,9 @@ func normalizeResponsesCustomToolCallOutput(obj map[string]any, i int) (any, *re
 	if strings.TrimSpace(callID) == "" {
 		return nil, invalidResponses("input", fmt.Sprintf("input[%d]: custom_tool_call_output.call_id is required", i))
 	}
-	var content string
-	switch out := obj["output"].(type) {
-	case nil:
-		content = ""
-	case string:
-		content = out
-	default:
-		b, err := json.Marshal(out)
-		if err != nil {
-			return nil, invalidResponses("input",
-				fmt.Sprintf("input[%d]: custom_tool_call_output.output could not be encoded", i))
-		}
-		content = string(b)
+	content, rerr := responsesOutputContent(obj["output"], "custom_tool_call_output", i)
+	if rerr != nil {
+		return nil, rerr
 	}
 	return map[string]any{"role": "tool", "tool_call_id": callID, "content": content}, nil
 }
