@@ -573,6 +573,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .acc.req .muted { color: var(--ink-3); }
   .src-off { color: var(--warn); }
 
+  /* ── 搜索统计 ─────────────────────────────────────────────────── */
+  #view-search .box > header { flex-wrap: wrap; }
+  #view-search .box > header > .note {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .acc.search { min-width: 980px; }
+  .acc.search th, .acc.search td { padding: 9px 10px; }
+  .acc.search .engine { font-family: var(--mono); font-weight: 600; }
+  .acc.search .query {
+    max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .acc.search .err {
+    max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--bad);
+  }
+  .acc.search .muted { color: var(--ink-3); }
+
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
   /* 到期提醒卡片（首页）：每账号一行，色点=危险度，正文数字用 mono 对齐。 */
@@ -602,6 +620,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#search" data-view="search">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="6.8" cy="6.8" r="4.3"/><path d="m10 10 4 4"/><path d="M4.8 6.8h4M6.8 4.8v4"/></svg>
+        搜索统计</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -907,6 +928,58 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <table class="acc zebra">
             <thead id="usCreditHead"></thead>
             <tbody id="usCreditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 搜索统计 -->
+    <section class="view" id="view-search" hidden>
+      <div class="box">
+        <header>
+          <h3>搜索统计 <span class="hint">网关 web_search 服务端工具 · 进程启动以来累计</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="ssNote">—</span>
+          <button class="xs" id="btnSearchStats">刷新</button>
+        </header>
+        <div class="kpis" id="ssStats"></div>
+        <div class="pad">
+          <div class="note" id="ssCacheNote">—</div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>检索引擎健康度 <span class="hint">连续失败 3 次标记为不可用</span></h3>
+          <span class="grow"></span>
+          <span class="note">只统计实际访问搜索引擎的请求；TTL 命中不计入引擎尝试</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc search">
+            <thead><tr>
+              <th>引擎</th><th>状态</th><th class="num">尝试</th>
+              <th class="num">成功</th><th class="num">失败</th><th class="num">成功率</th>
+              <th class="num">平均延迟</th><th class="num">最近延迟</th>
+              <th>最近尝试</th><th>最近错误</th>
+            </tr></thead>
+            <tbody id="ssEngineBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>最近检索</h3>
+          <span class="grow"></span>
+          <span class="note" id="ssRecentNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc search">
+            <thead><tr>
+              <th>时间</th><th>缓存</th><th>结果</th><th>引擎</th>
+              <th>查询</th><th class="num">条数</th><th class="num">耗时</th><th>错误</th>
+            </tr></thead>
+            <tbody id="ssRecentBody"></tbody>
           </table>
         </div>
       </div>

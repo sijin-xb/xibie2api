@@ -170,7 +170,8 @@ type Handler struct {
 	rateIP rateIPGate
 	// searchCache web_search 服务端工具的查询级 TTL 缓存（messages_websearch.go）：
 	// agent 客户端工具循环内同轮重复请求不再重复检索。
-	searchCache webSearchCache
+	searchCache     webSearchCache
+	searchTelemetry *webSearchTelemetry
 }
 
 // NewHandler 构建 handler。
@@ -195,12 +196,17 @@ func NewHandler(cfg Config) *Handler {
 	h.rateIP.threshold = cfg.RateIPThreshold
 	h.rateIP.window = cfg.RateIPWindow
 	h.searchCache = newWebSearchCache(10*time.Minute, 64)
+	h.searchTelemetry = newWebSearchTelemetry(30)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("POST /v1/messages", h.withAuthMessages(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
+	// 面板搜索统计由 server 直接提供：数据源在 handler 内的 TTL 缓存与检索
+	// 遥测，panel 只负责页面和同口径 Bearer 鉴权。该精确路径比 /panel/ 子树
+	// 更具体，因此不会被面板 handler 截走。
+	h.mux.HandleFunc("GET /panel/api/search_stats", h.withAuth(h.webSearchStatsHandler))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向

@@ -338,7 +338,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', search: '搜索统计', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -348,6 +348,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
+  if (v === 'search') loadSearchStats();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
@@ -1217,6 +1218,7 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
+  else if (view === 'search') loadSearchStats(true);
   else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
@@ -2316,6 +2318,125 @@ async function loadUsage() {
   // 连坐——台账读的是本地文件，几乎不会失败。
   loadKeyUsage();
 }
+
+/* ── 搜索统计 ─────────────────────────────────────────────────────── */
+/* 数据由 server 的 /panel/api/search_stats 直接提供。缓存命中/未命中来自
+   webSearchCache 自身计数；引擎健康度来自 runWebSearch 写入的有界检索日志。
+   两种口径分开：TTL 命中不会伪装成一次成功的搜索引擎请求。 */
+function searchEngineStatus(status) {
+  const meta = {
+    healthy: ['正常', 'ok'],
+    degraded: ['异常', 'warn'],
+    down: ['不可用', 'bad'],
+    disabled: ['未启用', 'mute'],
+    unknown: ['待观测', 'mute'],
+  }[status] || [status || '未知', 'mute'];
+  return '<span class="tag ' + meta[1] + '">' + esc(meta[0]) + '</span>';
+}
+
+function searchEventTags(e) {
+  const cache = e && e.cache_hit
+    ? '<span class="tag ok">TTL 命中</span>'
+    : '<span class="tag mute">未命中</span>';
+  const ok = !!(e && e.success);
+  const result = ok
+    ? '<span class="tag ok">成功</span>'
+    : '<span class="tag bad">' + (e && e.cache_hit ? '缓存错误' : '失败') + '</span>';
+  return { cache, result };
+}
+
+function renderSearchStats(d) {
+  d = d || {};
+  const cache = d.cache || {};
+  const engines = Array.isArray(d.engines) ? d.engines : [];
+  const recent = Array.isArray(d.recent) ? d.recent : [];
+  const attempts = engines.reduce((sum, e) => sum + Number(e.attempts || 0), 0);
+  const successes = engines.reduce((sum, e) => sum + Number(e.successes || 0), 0);
+  const latencyWeighted = engines.reduce((sum, e) =>
+    sum + Number(e.average_latency_ms || 0) * Number(e.attempts || 0), 0);
+  const avgLatency = attempts ? latencyWeighted / attempts : 0;
+  const hitRate = Number(cache.hit_rate || 0);
+  const hitCls = hitRate >= 60 ? 'c-ok' : hitRate > 0 ? 'c-warn' : 'c-mute';
+  const queryMode = d.query_mode === 'model' ? '模型提炼查询' : '原始问题查询';
+
+  $('ssStats').innerHTML =
+    usKpi(fmtTok(d.queries), '检索查询', 'c-accent',
+      d.enabled ? (d.backend || '已启用') + ' · ' + queryMode : 'web_search 未启用') +
+    usKpi(Number(cache.hits || 0) + Number(cache.misses || 0) ? hitRate.toFixed(1) + '%' : '—', 'TTL 命中率', hitCls,
+      '命中 / (命中 + 未命中)') +
+    usKpi(fmtTok(cache.hits), '缓存命中', 'c-ok', '未访问搜索引擎') +
+    usKpi(fmtTok(cache.misses), '缓存未命中', 'c-warn', '其中过期 ' + fmtTok(cache.expired)) +
+    usKpi(fmtTok(cache.active_entries) + ' / ' + fmtTok(cache.max_keys), '活跃缓存键', 'c-soft',
+      'TTL ' + dur(Number(cache.ttl_seconds || 0))) +
+    usKpi(fmtMs(avgLatency), '引擎平均延迟', 'c-soft',
+      attempts ? successes + ' / ' + attempts + ' 次成功' : '尚无引擎请求');
+
+  $('ssNote').textContent = d.enabled
+    ? (d.backend || '未知引擎') + ' · ' + queryMode + ' · 最近 ' + recent.length + ' 条'
+    : 'web_search 未启用';
+  $('ssCacheNote').textContent =
+    'TTL ' + dur(Number(cache.ttl_seconds || 0)) +
+    ' · 活跃 ' + Number(cache.active_entries || 0) + ' / ' + Number(cache.max_keys || 0) +
+    ' · 累计过期 ' + Number(cache.expired || 0) + ' 次' +
+    ' · 容量淘汰 ' + Number(cache.evicted || 0) + ' 个键' +
+    ' · 数据保存在当前进程内存，重启后清零';
+
+  $('ssEngineBody').innerHTML = engines.map(e => {
+    const successRate = Number(e.attempts || 0)
+      ? Number(e.success_rate || 0).toFixed(1) + '%'
+      : '—';
+    return '<tr>' +
+      '<td class="engine">' + esc(e.backend || '—') + '</td>' +
+      '<td>' + searchEngineStatus(e.status) + '</td>' +
+      '<td class="num">' + fmtTok(e.attempts) + '</td>' +
+      '<td class="num">' + fmtTok(e.successes) + '</td>' +
+      '<td class="num">' + (Number(e.failures || 0)
+        ? '<span style="color:var(--bad)">' + fmtTok(e.failures) + '</span>' : '0') + '</td>' +
+      '<td class="num">' + successRate + '</td>' +
+      '<td class="num">' + fmtMs(e.average_latency_ms) + '</td>' +
+      '<td class="num">' + fmtMs(e.last_latency_ms) + '</td>' +
+      '<td class="num">' + (e.last_attempt_at ? esc(fmtLocalDateTime(parseAPITime(e.last_attempt_at))) : '—') + '</td>' +
+      '<td class="err" title="' + esc(e.last_error || '') + '">' +
+        (e.last_error ? esc(e.last_error) : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">' +
+    (d.enabled ? '尚无实际检索请求' : 'web_search 未启用') + '</td></tr>';
+
+  $('ssRecentBody').innerHTML = recent.map(e => {
+    const tags = searchEventTags(e);
+    const when = e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+    return '<tr title="' + esc(e.query || '') + '">' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td>' + tags.cache + '</td>' +
+      '<td>' + tags.result + '</td>' +
+      '<td class="engine">' + esc(e.backend || '—') + '</td>' +
+      '<td class="query">' + esc(e.query || '—') + '</td>' +
+      '<td class="num">' + (e.cache_hit && e.success ? '缓存' : fmtTok(e.results)) + '</td>' +
+      '<td class="num">' + fmtMs(e.latency_ms) + '</td>' +
+      '<td class="err" title="' + esc(e.error || '') + '">' +
+        (e.error ? esc(e.error) : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">暂无检索记录</td></tr>';
+  $('ssRecentNote').textContent = recent.length + ' 条 · 新到旧 · 最多保留 30 条';
+}
+
+async function loadSearchStats(quiet) {
+  if (!quiet) {
+    $('ssNote').textContent = '读取中…';
+  }
+  try {
+    renderSearchStats(await api('search_stats'));
+  } catch (e) {
+    $('ssStats').innerHTML = '';
+    $('ssEngineBody').innerHTML = '<tr><td colspan="10" class="empty">读取搜索统计失败：' + esc(e.message) + '</td></tr>';
+    $('ssRecentBody').innerHTML = '<tr><td colspan="8" class="empty">读取搜索统计失败</td></tr>';
+    $('ssNote').textContent = '—';
+    $('ssCacheNote').textContent = '—';
+    $('ssRecentNote').textContent = '—';
+  }
+}
+
+if ($('btnSearchStats')) $('btnSearchStats').onclick = () => loadSearchStats();
 
 /* ── 逐 API Key 用量台账 ───────────────────────────────────────────── */
 /* 数据源是网关的 data/key-usage.json（只存密钥指纹与备注名，不存密钥原文），

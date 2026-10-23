@@ -46,9 +46,13 @@ func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *tu
 		ws.err = "no search query could be derived from the request"
 		return
 	}
-	if hit, ok := h.searchCache.get(ws.searchKey()); ok {
+	// 缓存键必须使用提炼前的原始查询：查询提炼发生在缓存查询之后，若 put
+	// 使用提炼后的 query，下一次同问仍会 miss，TTL 缓存形同虚设。
+	cacheKey := ws.searchKey()
+	if hit, ok := h.searchCache.get(cacheKey); ok {
 		ws.results = hit.results
 		ws.err = hit.err
+		h.searchTelemetry.recordCacheHit(c.Backend(), ws.query, hit)
 		return
 	}
 	if p != nil && h.cfg.WebSearchQueryMode == "model" {
@@ -58,18 +62,24 @@ func (h *Handler) runWebSearch(ctx context.Context, ws *messagesWebSearch, p *tu
 	}
 	// max_uses caps how many times the tool may run per turn, not how many
 	// results one run returns; result count belongs to web_search.max_results.
+	started := time.Now()
 	results, err := c.Search(ctx, ws.query, 0, ws.allowedDomains, ws.blockedDomains)
+	latency := time.Since(started)
 	if err != nil {
 		ws.err = err.Error()
 		ws.fresh = true
-		h.searchCache.put(ws.searchKey(), nil, ws.err)
-		log.Printf("WARN: [server] web_search: backend=%s query=%q failed: %v", c.Backend(), ws.query, err)
+		h.searchCache.put(cacheKey, nil, ws.err)
+		h.searchTelemetry.recordAttempt(c.Backend(), ws.query, 0, latency, err)
+		log.Printf("WARN: [server] web_search: backend=%s query=%q failed after %s: %v",
+			c.Backend(), ws.query, latency.Round(time.Millisecond), err)
 		return
 	}
 	ws.results = results
 	ws.fresh = true
-	h.searchCache.put(ws.searchKey(), results, "")
-	log.Printf("INFO: [server] web_search: backend=%s query=%q results=%d", c.Backend(), ws.query, len(results))
+	h.searchCache.put(cacheKey, results, "")
+	h.searchTelemetry.recordAttempt(c.Backend(), ws.query, len(results), latency, nil)
+	log.Printf("INFO: [server] web_search: backend=%s query=%q results=%d latency=%s",
+		c.Backend(), ws.query, len(results), latency.Round(time.Millisecond))
 }
 
 // searchKey 缓存键：查询原文 + 域过滤（过滤不同则结果不同）。用提炼前的原文做键，
@@ -92,6 +102,10 @@ type webSearchCache struct {
 	ttl     time.Duration
 	maxKeys int
 	entries map[string]webSearchCacheEntry
+	hits    int64
+	misses  int64
+	expired int64
+	evicted int64
 }
 
 func newWebSearchCache(ttl time.Duration, maxKeys int) webSearchCache {
@@ -108,12 +122,17 @@ func (c *webSearchCache) get(key string) (webSearchCacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
-	if !ok || time.Now().After(e.expires) {
-		if ok {
-			delete(c.entries, key)
-		}
+	if !ok {
+		c.misses++
 		return webSearchCacheEntry{}, false
 	}
+	if time.Now().After(e.expires) {
+		c.expired++
+		c.misses++
+		delete(c.entries, key)
+		return webSearchCacheEntry{}, false
+	}
+	c.hits++
 	return e, true
 }
 
@@ -129,10 +148,39 @@ func (c *webSearchCache) put(key string, results []websearch.Result, err string)
 		}
 		// 过期清扫后仍满：整表淘汰（重建成本低于 LRU 复杂度）。
 		if len(c.entries) >= c.maxKeys {
+			c.evicted += int64(len(c.entries))
 			c.entries = map[string]webSearchCacheEntry{}
 		}
 	}
 	c.entries[key] = webSearchCacheEntry{results: results, err: err, expires: time.Now().Add(c.ttl)}
+}
+
+// snapshot 返回缓存状态。active_entries 只计尚未过期的条目；缓存本身按需清理，
+// 不因一次只读观测而修改 map。
+func (c *webSearchCache) snapshot(now time.Time) webSearchCacheSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	active := 0
+	for _, e := range c.entries {
+		if now.Before(e.expires) {
+			active++
+		}
+	}
+	total := c.hits + c.misses
+	hitRate := 0.0
+	if total > 0 {
+		hitRate = float64(c.hits) / float64(total) * 100
+	}
+	return webSearchCacheSnapshot{
+		TTLSeconds:    int64(c.ttl / time.Second),
+		MaxKeys:       c.maxKeys,
+		ActiveEntries: active,
+		Hits:          c.hits,
+		Misses:        c.misses,
+		Expired:       c.expired,
+		Evicted:       c.evicted,
+		HitRate:       hitRate,
+	}
 }
 
 // searchQuerySystemPrompt 查询提炼提示词：让模型输出一条搜索引擎友好的查询串。
