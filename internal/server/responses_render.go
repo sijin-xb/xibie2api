@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -122,15 +123,12 @@ type responsesSink struct {
 	reasoningClosed bool
 	reasoningText   strings.Builder
 
-	// web_search_call item（网关服务端检索的动作回执）：fresh 检索在首个输出
-	// item 之前发出，Codex 据此在 UI 展示「已联网搜索」。output_index 最小。
-	searchID      string
-	searchIndex   int
-	searchEmitted bool
-	searchQuery   string
-
 	toolCalls map[int]*responsesToolCall
 	toolOrder []int
+	// droppedSearchCalls 模型主动调用模式下被拦截的 web_search 调用（按上游
+	// tool_calls index）：合成工具只由网关执行，任何路径（含标记修复还原）都
+	// 不得把它透出给客户端——Codex 无法执行该名字的 function_call。
+	droppedSearchCalls map[int]bool
 
 	nextIndex int
 	usage     map[string]any
@@ -159,9 +157,6 @@ func newResponsesSink(w io.Writer, fl http.Flusher, meta responsesMeta) *respons
 		reasoningID: "rs_" + randHex(16),
 		toolCalls:   map[int]*responsesToolCall{},
 	}
-	if meta.webSearch != nil {
-		s.searchQuery = meta.webSearch.query
-	}
 	return s
 }
 
@@ -184,8 +179,7 @@ func (s *responsesSink) emit(event string, data map[string]any) error {
 	return nil
 }
 
-// ensureStarted 惰性发出 response.created + response.in_progress（仅一次），随后
-// 若本次是 fresh 检索，先发出 web_search_call item（output_index 0，先于一切输出）。
+// ensureStarted 惰性发出 response.created + response.in_progress（仅一次）。
 func (s *responsesSink) ensureStarted() error {
 	if s.started {
 		return nil
@@ -194,45 +188,7 @@ func (s *responsesSink) ensureStarted() error {
 	if err := s.emit("response.created", map[string]any{"response": s.responseObject("in_progress", false)}); err != nil {
 		return err
 	}
-	if err := s.emit("response.in_progress", map[string]any{"response": s.responseObject("in_progress", false)}); err != nil {
-		return err
-	}
-	return s.emitWebSearchCall()
-}
-
-// emitWebSearchCall 发出 web_search_call item（added → done 生命周期）。检索在
-// 出站前已完成，done 直接 completed。仅 fresh 检索发出；TTL 缓存命中（同轮重复
-// 请求）不重复发。查询串缺失（提炼失败回落空）时退化为无 action 形态。
-func (s *responsesSink) emitWebSearchCall() error {
-	if s.searchEmitted || s.meta.webSearch == nil || !s.meta.webSearch.fresh {
-		return nil
-	}
-	s.searchEmitted = true
-	s.searchID = "ws_" + randHex(16)
-	s.searchIndex = s.nextOutputIndex()
-	added := map[string]any{
-		"id":     s.searchID,
-		"type":   "web_search_call",
-		"status": "in_progress",
-	}
-	if err := s.emit("response.output_item.added", map[string]any{
-		"output_index": s.searchIndex,
-		"item":         added,
-	}); err != nil {
-		return err
-	}
-	done := map[string]any{
-		"id":     s.searchID,
-		"type":   "web_search_call",
-		"status": "completed",
-	}
-	if s.searchQuery != "" {
-		done["action"] = map[string]any{"type": "search", "query": s.searchQuery}
-	}
-	return s.emit("response.output_item.done", map[string]any{
-		"output_index": s.searchIndex,
-		"item":         done,
-	})
+	return s.emit("response.in_progress", map[string]any{"response": s.responseObject("in_progress", false)})
 }
 
 // responseObject 构造 Responses 响应对象；completed=true 时填 completed_at。
@@ -367,23 +323,37 @@ func (s *responsesSink) pendingPhase() string {
 	if len(s.toolOrder) > 0 || s.finish != "stop" {
 		return "final_answer"
 	}
-	text := strings.TrimSpace(strings.Join(s.pending, ""))
-	if text == "" || len([]rune(text)) > 240 {
-		return "final_answer"
-	}
-	markers := []string{
-		"现在创建", "现在执行", "现在运行", "现在检查", "现在写入",
-		"接下来创建", "接下来执行", "接下来运行", "接下来检查", "接下来写入",
-		"下面创建", "下面执行", "下面运行", "下面检查", "下面写入",
-		"I will now create", "I will now execute", "I will now run", "I will now check",
-		"Next, I will create", "Next, I will execute", "Next, I will run", "Next, I will check",
-	}
-	for _, marker := range markers {
-		if strings.Contains(text, marker) {
-			return "commentary"
-		}
+	if classifyPendingNarration(strings.Join(s.pending, "")) {
+		return "commentary"
 	}
 	return "final_answer"
+}
+
+// maxPendingNarrationRunes 过程播报判定的文本长度上限：超过更像正式回答。
+const maxPendingNarrationRunes = 240
+
+// pendingNarrationMarkers 「宣布下一步动作」的标记短语（中英）。
+var pendingNarrationMarkers = []string{
+	"现在创建", "现在执行", "现在运行", "现在检查", "现在写入", "现在做",
+	"接下来创建", "接下来执行", "接下来运行", "接下来检查", "接下来写入", "接下来做",
+	"下面创建", "下面执行", "下面运行", "下面检查", "下面写入",
+	"I will now create", "I will now execute", "I will now run", "I will now check", "I will now do",
+	"Next, I will create", "Next, I will execute", "Next, I will run", "Next, I will check", "Next, I will do",
+}
+
+// classifyPendingNarration 判定一段收尾文本是否为「宣布下一步动作」的过程播报：
+// 非空、不太长、命中标记短语。流式 pendingPhase 与回放 replayForceFollowUp 共用。
+func classifyPendingNarration(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || len([]rune(text)) > maxPendingNarrationRunes {
+		return false
+	}
+	for _, marker := range pendingNarrationMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // appendReasoning 累积思维链并发出 reasoning_summary_text.delta。
@@ -473,17 +443,6 @@ func (s *responsesSink) completedReasoningItem() map[string]any {
 	}
 }
 
-// completedWebSearchItem 终态 output 里的 web_search_call item（与流式 done 事件同形）。
-func (s *responsesSink) completedWebSearchItem() map[string]any {
-	item := map[string]any{
-		"id": s.searchID, "type": "web_search_call", "status": "completed",
-	}
-	if s.searchQuery != "" {
-		item["action"] = map[string]any{"type": "search", "query": s.searchQuery}
-	}
-	return item
-}
-
 // appendText 暂存正文，直到工具边界或流尾确定 phase。
 func (s *responsesSink) appendText(txt string) error {
 	s.pending = append(s.pending, txt)
@@ -570,6 +529,19 @@ func (s *responsesSink) handleToolCall(tc map[string]any) error {
 	idx := 0
 	if v, ok := tc["index"].(float64); ok {
 		idx = int(v)
+	}
+	if s.droppedSearchCalls[idx] {
+		return nil
+	}
+	if fn, ok := tc["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); s.meta.webSearch != nil && name == searchFunctionName {
+			if s.droppedSearchCalls == nil {
+				s.droppedSearchCalls = map[int]bool{}
+			}
+			s.droppedSearchCalls[idx] = true
+			log.Printf("WARN: [server] responses: dropped leaked web_search call (index %d) from client stream", idx)
+			return nil
+		}
 	}
 	st := s.toolCalls[idx]
 	if st == nil {
@@ -754,7 +726,32 @@ func (s *responsesSink) Done() error {
 	resp := s.responseObject("completed", true)
 	resp["output"] = s.finalOutput()
 	resp["usage"] = responsesUsage(s.usage)
+	if s.shouldForceFollowUp() {
+		resp["end_turn"] = false
+		log.Printf("INFO: [server] responses: end_turn=false forced (pending narration without tool calls; trailing assistant msgs=%d)",
+			s.meta.trailingAssistantMsgs)
+	}
 	return s.emit("response.completed", map[string]any{"response": resp})
+}
+
+// maxForcedFollowUps end_turn:false 强制续跑的防抖上限：客户端历史末尾已有这么多
+// 条连续 assistant 消息（= 前几次强制续跑都没换来工具调用）就不再强制，回合自然
+// 结束。2 = 模型连续三次只播报不干活时放手。
+const maxForcedFollowUps = 2
+
+// shouldForceFollowUp 判定是否给 response.completed 附 end_turn:false。
+//
+// 触发场景（实测 DeepSeek 系高发）：模型以「现在做 X」的过程播报收尾、却没发出
+// 任何工具调用——Codex 收到无工具调用的 completed 即结束回合，X 永远不会被做。
+// 附 end_turn:false 后 Codex 会自动发 follow-up 请求让回合继续。
+//
+// 条件：本响应以 commentary 播报收尾（pendingPhase 的标记判定）且没有任何工具
+// 调用；防抖见 countTrailingAssistantMessages——无状态网关只能从输入历史反推
+// 已强制次数，模型若持续只播报不调工具，强制链在 maxForcedFollowUps 后停止，
+// 避免无限请求循环烧穿 token。
+func (s *responsesSink) shouldForceFollowUp() bool {
+	return s.msgPhase == "commentary" && len(s.toolOrder) == 0 &&
+		s.meta.trailingAssistantMsgs < maxForcedFollowUps
 }
 
 // incompleteReason 把上游未正常完成的 finish_reason 映射为 Responses 的
@@ -863,9 +860,6 @@ func (s *responsesSink) finalOutput() []any {
 		item any
 	}
 	entries := make([]entry, 0, 1+len(s.toolOrder)+len(s.msgItems))
-	if s.searchEmitted {
-		entries = append(entries, entry{s.searchIndex, s.completedWebSearchItem()})
-	}
 	if s.reasoningOpened {
 		entries = append(entries, entry{s.reasoningIndex, s.completedReasoningItem()})
 	}
@@ -952,14 +946,6 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 	}
 
 	output := make([]any, 0, 2+len(toolCalls))
-	// web_search_call（fresh 检索的动作回执）排在最前，与流式路径 output_index 语义一致。
-	if meta.webSearch != nil && meta.webSearch.fresh {
-		item := map[string]any{"id": "ws_" + randHex(16), "type": "web_search_call", "status": "completed"}
-		if meta.webSearch.query != "" {
-			item["action"] = map[string]any{"type": "search", "query": meta.webSearch.query}
-		}
-		output = append(output, item)
-	}
 	// reasoning item 必须排在 message item 之前（Responses 语义顺序）。
 	if reasoning != "" {
 		output = append(output, map[string]any{
@@ -982,6 +968,9 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		if fn, ok := tc["function"].(map[string]any); ok {
 			name, _ = fn["name"].(string)
 			args, _ = fn["arguments"].(string)
+		}
+		if meta.webSearch != nil && name == searchFunctionName {
+			continue
 		}
 		// 还原 namespace / custom 形态：上游只见过摊平后的扁平 function 名。
 		if ref, ok := meta.toolRefs[name]; ok {

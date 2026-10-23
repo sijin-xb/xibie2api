@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/websearch"
 )
 
 // buildCodexHistory 构造 Codex 长会话形态的归一化 body：system 基础指令 + 首条
@@ -117,66 +119,119 @@ func TestWebSearchCache(t *testing.T) {
 	}
 }
 
-// TestResponsesWebSearchStream：声明 web_search 工具的 /v1/responses 请求——
-// 首次：检索执行（fresh），SSE 先发 web_search_call item，检索结果注入出站 prompt；
-// 同查询第二次（TTL 缓存命中）：不再发 web_search_call item，但结果照常注入。
-func TestResponsesWebSearchStream(t *testing.T) {
-	up, calls := newRegressionUpstream(func(int, string, []byte) (int, string, bool) {
+// sseSearchToolCall：模型调用 web_search 合成工具的流（聚合后含 tool_calls）。
+const sseSearchToolCall = `data: {"id":"chatcmpl-ws","object":"chat.completion.chunk","created":1753600000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ws1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"golang 1.26 release notes\"}"}}]}}]}
+
+data: {"id":"chatcmpl-ws","object":"chat.completion.chunk","created":1753600000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":70}}
+
+data: [DONE]
+
+`
+
+// countingSearxngClient 起一个计数命中的假 SearXNG，返回 (client, 命中数取值函数)。
+func countingSearxngClient(t *testing.T, url string) (*websearch.Client, func() int) {
+	t.Helper()
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"url":"` + url + `","title":"T","content":"snippet"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	return websearch.NewClient(websearch.Config{
+		Enabled: true, Backend: "searxng", BaseURL: srv.URL, MaxResults: 5,
+	}), func() int { return int(atomic.LoadInt32(&hits)) }
+}
+
+// TestResponsesModelInvokedSearch：模型主动调用模式——模型调 web_search →
+// 网关检索回填 → 重发上游 → 客户端看到 web_search_call item + 最终回答。
+func TestResponsesModelInvokedSearch(t *testing.T) {
+	up, calls := newRegressionUpstream(func(n int, _ string, body []byte) (int, string, bool) {
+		if n == 1 {
+			return 200, sseSearchToolCall, true
+		}
 		return 200, respTextSSE, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, WebSearch: newSearxngTestClient(t, "https://a.example/1")})
+	ws, hits := countingSearxngClient(t, "https://a.example/1")
+	h := NewHandler(Config{Pool: p, Upstream: up, WebSearch: ws})
 
-	reqBody := `{"model":"glm-5.2","stream":true,"tools":[{"type":"web_search"}],"input":"golang 1.24 release notes"}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(reqBody)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"glm-5.2","stream":true,"tools":[{"type":"web_search"}],"input":"golang 1.26 发布了什么"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	events := parseSSEEvents(t, rec.Body.String())
-	added := eventsNamed(events, "response.output_item.added")
-	if len(added) == 0 {
-		t.Fatalf("no output_item.added events: %v", eventNames(events))
-	}
-	wsItem, _ := added[0].data["item"].(map[string]any)
-	if wsItem["type"] != "web_search_call" {
-		t.Fatalf("first item=%v want web_search_call", wsItem)
-	}
-	// done 事件带 action.query。
-	for _, e := range eventsNamed(events, "response.output_item.done") {
-		if item, _ := e.data["item"].(map[string]any); item["type"] == "web_search_call" {
+	var sawSearch, sawMessage bool
+	for _, e := range eventsNamed(events, "response.output_item.added") {
+		item, _ := e.data["item"].(map[string]any)
+		switch item["type"] {
+		case "web_search_call":
+			sawSearch = true
 			action, _ := item["action"].(map[string]any)
-			if action["type"] != "search" || !strings.Contains(action["query"].(string), "golang") {
+			if action["query"] != "golang 1.26 release notes" {
 				t.Fatalf("web_search_call action=%v", action)
 			}
+		case "message":
+			sawMessage = true
 		}
 	}
-	// 检索结果注入出站 prompt。
+	if !sawSearch || !sawMessage {
+		t.Fatalf("sawSearch=%v sawMessage=%v events=%v", sawSearch, sawMessage, eventNames(events))
+	}
+	if lastEventNamed(t, rec.Body.String(), "response.completed") == nil {
+		t.Fatal("stream must complete")
+	}
+	// 引擎只打一次；上游两轮：第一轮带合成工具，第二轮带检索结果。
+	if n := hits(); n != 1 {
+		t.Fatalf("searxng hits=%d want 1", n)
+	}
 	cs := calls()
-	if len(cs) != 1 {
-		t.Fatalf("upstream calls=%d", len(cs))
+	if len(cs) != 2 {
+		t.Fatalf("upstream calls=%d want 2", len(cs))
 	}
-	if !strings.Contains(string(cs[0].body), "https://a.example/1") {
-		t.Fatalf("search results not injected into outbound body: %s", cs[0].body)
+	if !strings.Contains(string(cs[0].body), `"web_search"`) {
+		t.Fatalf("round1 body must declare the synthetic tool: %s", cs[0].body)
 	}
+	if !strings.Contains(string(cs[1].body), "https://a.example/1") {
+		t.Fatalf("round2 body must carry search results: %s", cs[1].body)
+	}
+}
 
-	// 第二次同查询：缓存命中 → 无 web_search_call item，注入照常。
-	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(reqBody)))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
+// TestResponsesModelInvokedSearchNoSearchNeeded：模型直接回答（编码任务常态）——
+// 不触发任何检索（旧预检索模式对整段任务书搜索的浪费点），合成工具已声明。
+func TestResponsesModelInvokedSearchNoSearchNeeded(t *testing.T) {
+	up, calls := newRegressionUpstream(func(int, string, []byte) (int, string, bool) {
+		return 200, respTextSSE, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	ws, hits := countingSearxngClient(t, "https://a.example/1")
+	h := NewHandler(Config{Pool: p, Upstream: up, WebSearch: ws})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"glm-5.2","stream":true,"tools":[{"type":"web_search"}],"input":"在本地加一个搜索统计视图"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	for _, e := range parseSSEEvents(t, rec2.Body.String()) {
+	for _, e := range parseSSEEvents(t, rec.Body.String()) {
 		if e.name != "response.output_item.added" && e.name != "response.output_item.done" {
 			continue
 		}
 		if item, _ := e.data["item"].(map[string]any); item["type"] == "web_search_call" {
-			t.Fatal("cached search must not re-emit web_search_call item")
+			t.Fatal("no search ran; web_search_call item must not appear")
 		}
 	}
-	cs2 := calls()
-	if len(cs2) != 2 || !strings.Contains(string(cs2[1].body), "https://a.example/1") {
-		t.Fatalf("cached results must still be injected (calls=%d)", len(cs2))
+	if n := hits(); n != 0 {
+		t.Fatalf("searxng hits=%d want 0 (model did not ask to search)", n)
+	}
+	cs := calls()
+	if len(cs) != 1 {
+		t.Fatalf("upstream calls=%d want 1", len(cs))
+	}
+	if !strings.Contains(string(cs[0].body), `"web_search"`) {
+		t.Fatalf("body must declare the synthetic tool so the model CAN search: %s", cs[0].body)
 	}
 }
 
@@ -220,4 +275,118 @@ func buildCodexResponsesBody(n int) string {
 	}
 	sb.WriteString(`,{"type":"message","role":"user","content":"continue"}]}`)
 	return sb.String()
+}
+
+// ssePendingNarration：「现在检查…」播报收尾 + 无工具调用 + stop——end_turn:false
+// 强制续跑的触发形态。
+const ssePendingNarration = `data: {"id":"chatcmpl-pending","object":"chat.completion.chunk","created":1753600000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"定向测试已通过，现在检查全量测试。"}}]}
+
+data: {"id":"chatcmpl-pending","object":"chat.completion.chunk","created":1753600000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112}}
+
+data: [DONE]
+
+`
+
+// TestResponsesEndTurnForcedFollowUp：播报收尾且无工具调用 → response.completed
+// 附 end_turn:false（Codex 自动 follow-up）；历史末尾已有 2 条连续 assistant
+// 消息（防抖上限）→ 不附。
+func TestResponsesEndTurnForcedFollowUp(t *testing.T) {
+	up, _ := staticRegressionUpstream(200, ssePendingNarration, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	freshInput := `{"model":"glm-5.2","stream":true,"input":[{"type":"message","role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(freshInput)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	completed := lastEventNamed(t, rec.Body.String(), "response.completed")
+	resp := completed["response"].(map[string]any)
+	if resp["end_turn"] != false {
+		t.Fatalf("end_turn=%v want false on pending narration", resp["end_turn"])
+	}
+
+	saturatedInput := `{"model":"glm-5.2","stream":true,"input":[` +
+		`{"type":"message","role":"user","content":"hi"},` +
+		`{"type":"message","role":"assistant","content":"现在检查一下。"},` +
+		`{"type":"message","role":"assistant","content":"现在运行测试。"}]}`
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(saturatedInput)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	completed2 := lastEventNamed(t, rec2.Body.String(), "response.completed")
+	resp2 := completed2["response"].(map[string]any)
+	if _, has := resp2["end_turn"]; has {
+		t.Fatalf("end_turn must be absent when trailing assistant msgs >= %d", maxForcedFollowUps)
+	}
+
+	// 归一化侧：末尾连续 assistant 计数正确（中间夹 user 消息即中断）。
+	_, meta, err := normalizeResponsesRequest([]byte(saturatedInput))
+	if err != nil {
+		t.Fatalf("normalize: %+v", err)
+	}
+	if meta.trailingAssistantMsgs != 2 {
+		t.Fatalf("trailingAssistantMsgs=%d want 2", meta.trailingAssistantMsgs)
+	}
+	mixed := `{"model":"m","input":[{"type":"message","role":"assistant","content":"a"},{"type":"message","role":"user","content":"u"},{"type":"message","role":"assistant","content":"b"}]}`
+	_, meta2, _ := normalizeResponsesRequest([]byte(mixed))
+	if meta2.trailingAssistantMsgs != 1 {
+		t.Fatalf("trailingAssistantMsgs=%d want 1 (user breaks streak)", meta2.trailingAssistantMsgs)
+	}
+}
+
+// lastEventNamed 取最后一个指定名称的 SSE 事件 data。
+func lastEventNamed(t *testing.T, body, name string) map[string]any {
+	t.Helper()
+	var last map[string]any
+	for _, e := range parseSSEEvents(t, body) {
+		if e.name == name {
+			last = e.data
+		}
+	}
+	if last == nil {
+		t.Fatalf("no %s event in stream", name)
+	}
+	return last
+}
+
+// TestResponsesSearchBudgetExhaustedNoLeak：模型每轮都想搜（耗尽降级路径）——
+// 降级后的最终响应里绝不能出现 web_search function_call（Codex 无法执行）。
+func TestResponsesSearchBudgetExhaustedNoLeak(t *testing.T) {
+	up, calls := newRegressionUpstream(func(int, string, []byte) (int, string, bool) {
+		return 200, sseSearchToolCall, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	ws, hits := countingSearxngClient(t, "https://a.example/1")
+	h := NewHandler(Config{Pool: p, Upstream: up, WebSearch: ws})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"glm-5.2","stream":true,"tools":[{"type":"web_search"}],"input":"再搜点别的"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	for _, e := range parseSSEEvents(t, rec.Body.String()) {
+		if e.name != "response.output_item.added" && e.name != "response.output_item.done" {
+			continue
+		}
+		item, _ := e.data["item"].(map[string]any)
+		if item["type"] == "function_call" {
+			t.Fatalf("web_search function_call leaked to client: %v", item)
+		}
+	}
+	// 上游调用数 = 搜索轮（maxSearchRounds+1）+ 降级 runTurn 一跳；引擎命中被 TTL 缓存去重为 1。
+	if n := len(calls()); n < maxSearchRounds+1 {
+		t.Fatalf("upstream calls=%d want >= %d", n, maxSearchRounds+1)
+	}
+	if n := hits(); n != 1 {
+		t.Fatalf("searxng hits=%d want 1 (TTL dedup)", n)
+	}
+	// 降级 body 带引导 system 提示。
+	lastBody := string(calls()[len(calls())-1].body)
+	if !strings.Contains(lastBody, "no longer available") {
+		t.Fatalf("fallback body must carry steering note")
+	}
 }

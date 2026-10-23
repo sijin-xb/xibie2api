@@ -40,6 +40,9 @@ type responsesMeta struct {
 	parallelToolCalls any // 接受但不转发
 	reasoning         any // 原始 reasoning 对象（effort 已翻译进 body，此处仅回显）
 	stream            bool
+	// trailingAssistantMsgs 输入历史末尾连续 assistant message item 数。用于
+	// end_turn:false 强制续跑的无状态防抖（见 responses_render.go shouldForceFollowUp）。
+	trailingAssistantMsgs int
 	// webSearch 非 nil = Codex 声明了 web_search 服务端工具：出站前由网关检索
 	// （见 responses 入口），渲染层据此产出 web_search_call item。
 	webSearch *messagesWebSearch
@@ -87,12 +90,17 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer st.done()
-	// web_search 服务端工具（与 /v1/messages 路径同构）：Codex 声明 type:"web_search"
-	// 时由网关出站前实际检索，结果作为一条 system 消息注入 prompt，渲染层先产出
-	// 一个 web_search_call item 让 UI 可见。放在 prepareTurn 之后以复用选号/realm。
-	if meta.webSearch != nil {
-		h.runWebSearch(r.Context(), meta.webSearch, p)
-		p.body = injectSearchContext(p.body, meta.webSearch.results)
+	// web_search 服务端工具（模型主动调用模式，responses_searchloop.go）：客户端
+	// 声明 type:"web_search" 且检索后端可用时，出站 body 注入合成 web_search
+	// function 工具；模型调用 → 网关检索回填 → 重发上游，客户端只见 web_search_call
+	// item 与最终输出。任何中间失败降级为剥除工具的正常 runTurn。
+	// 后端未启用时不注入（模型无法搜索，客户端声明被跳过并记 WARN——见 mapResponsesTools）。
+	if meta.webSearch != nil && h.cfg.WebSearch != nil && h.cfg.WebSearch.Enabled() {
+		if h.runResponsesSearchLoop(r.Context(), w, st, p, meta) {
+			return
+		}
+		h.runTurn(r.Context(), w, st, p)
+		return
 	}
 	h.runTurn(r.Context(), w, st, p)
 }
@@ -220,6 +228,7 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		return nil, responsesMeta{}, rerr
 	}
 	messages = append(messages, inMsgs...)
+	trailingAsst := countTrailingAssistantMessages(inputVal)
 
 	// tools 映射（Responses 扁平形态 → OpenAI 嵌套 function 形态）。namespace /
 	// custom 工具会被摊平为上游可表达的 function，并记录还原映射。input 里
@@ -278,21 +287,48 @@ func normalizeResponsesRequest(raw []byte) ([]byte, responsesMeta, *responsesErr
 		return nil, responsesMeta{}, invalidResponses("", "failed to encode normalized request: "+merr.Error())
 	}
 	meta := responsesMeta{
-		model:             model,
-		instructions:      instructions,
-		tools:             tools,
-		toolChoice:        toolChoice,
-		temperature:       temperature,
-		topP:              topP,
-		maxOutputTokens:   maxOut,
-		metadata:          metadata,
-		parallelToolCalls: parallel,
-		reasoning:         reasoning,
-		stream:            stream,
-		webSearch:         ws,
-		toolRefs:          toolRefs,
+		model:                 model,
+		instructions:          instructions,
+		tools:                 tools,
+		toolChoice:            toolChoice,
+		temperature:           temperature,
+		topP:                  topP,
+		maxOutputTokens:       maxOut,
+		metadata:              metadata,
+		parallelToolCalls:     parallel,
+		reasoning:             reasoning,
+		stream:                stream,
+		webSearch:             ws,
+		trailingAssistantMsgs: trailingAsst,
+		toolRefs:              toolRefs,
 	}
 	return out, meta, nil
+}
+
+// countTrailingAssistantMessages 统计 input 数组末尾连续的 assistant message item
+// 数（任何非 assistant message 的 item 都中断计数）。用途：end_turn:false 强制
+// 续跑的无状态防抖——每次强制续跑都会往历史末尾追加一条 assistant 消息，末尾
+// 连续 assistant 数达到阈值即不再强制（见 responses_render.go shouldForceFollowUp）。
+func countTrailingAssistantMessages(input any) int {
+	arr, ok := input.([]any)
+	if !ok {
+		return 0
+	}
+	n := 0
+	for i := len(arr) - 1; i >= 0; i-- {
+		obj, ok := arr[i].(map[string]any)
+		if !ok {
+			break
+		}
+		if typ, _ := obj["type"].(string); typ != "message" {
+			break
+		}
+		if role, _ := obj["role"].(string); role != "assistant" {
+			break
+		}
+		n++
+	}
+	return n
 }
 
 // reasoningEffortOf 从 reasoning 对象提取 effort 字段（非空字符串才返回）。
