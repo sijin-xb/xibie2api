@@ -368,12 +368,20 @@ func (h *Handler) searchRoundOnce(ctx context.Context, st *chatStat, p *turnPara
 	rctx, cancel := context.WithTimeout(ctx, searchRoundTimeout)
 	defer cancel()
 	started := time.Now()
-	rc, status, _, err := h.cfg.Upstream.ChatStreamContext(rctx, acct, p.body, p.clientIP, p.chatMeta)
+	rc, status, respBody, err := h.cfg.Upstream.ChatStreamContext(rctx, acct, p.body, p.clientIP, p.chatMeta)
 	if err != nil || rc == nil {
+		// 传输层错误喂连败计数（与 runTurn 抖动分支同口径）：搜索轮此前只换号
+		// 不记账，账号坏状态收敛慢，每个请求都要白打满 searchRoundMaxPicks 发。
+		h.cfg.Pool.NoteFailures(acct.UID)
 		return nil, fmt.Errorf("transport: %v", err)
 	}
 	defer rc.Close()
 	if status >= 400 {
+		// 429 等分类错误应用与主管线一致的冷却策略：否则限流号不进冷却，
+		// 后续每个客户端请求的搜索轮都重复选中它（实测全池限流时每请求
+		// 白打 3 发 429 才降级）。
+		kind := upstream.Classify(status, string(respBody))
+		h.applyErrorPolicy(acct.UID, kind, string(respBody), p.bareModel, nil)
 		return nil, fmt.Errorf("upstream status %d", status)
 	}
 	resp, aerr := upstream.AggregateObserved(rc, func(string) {})

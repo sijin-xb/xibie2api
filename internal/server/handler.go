@@ -366,6 +366,27 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		snap.CacheHitTokens = t.CacheHitTokens
 		snap.CacheMissTokens = t.CacheMissTokens
 	}
+	// 搜索服务端工具观测：面板「搜索统计」同源快照（server 进程级计数）。
+	ss := h.webSearchStatsSnapshot()
+	snap.SearchEnabled = ss.Enabled
+	snap.SearchQueries = ss.Queries
+	snap.SearchCacheHits = ss.Cache.Hits
+	snap.SearchCacheMisses = ss.Cache.Misses
+	snap.SearchCacheExpired = ss.Cache.Expired
+	snap.SearchCacheEvicted = ss.Cache.Evicted
+	snap.SearchActiveKeys = int64(ss.Cache.ActiveEntries)
+	for _, eng := range ss.Engines {
+		status := eng.Status == "healthy" || eng.Status == "待观测"
+		snap.SearchEngines = append(snap.SearchEngines, metrics.SearchEngineMetric{
+			Backend:             eng.Backend,
+			Attempts:            eng.Attempts,
+			Successes:           eng.Successes,
+			Failures:            eng.Failures,
+			ConsecutiveFailures: int64(eng.ConsecutiveFailures),
+			AvgLatencySeconds:   float64(eng.AverageLatencyMs) / 1000,
+			Healthy:             status,
+		})
+	}
 	// 工具调用链路观测：配对管线（upstream 进程级计数）与原生标记还原（server 进程级计数）。
 	pc := upstream.SnapshotPairing()
 	snap.PairingMergedAdjacent = pc.MergedAdjacent

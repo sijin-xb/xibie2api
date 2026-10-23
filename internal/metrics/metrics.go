@@ -68,6 +68,27 @@ type Snapshot struct {
 	NativeRepairSeen      int64
 	NativeRepairConverted int64
 	NativeRepairRejected  int64
+
+	// 搜索服务端工具观测（server 进程级计数，见 websearch_stats.go；重启清零）。
+	SearchEnabled      bool
+	SearchQueries      int64
+	SearchCacheHits    int64
+	SearchCacheMisses  int64
+	SearchCacheExpired int64
+	SearchCacheEvicted int64
+	SearchActiveKeys   int64
+	SearchEngines      []SearchEngineMetric
+}
+
+// SearchEngineMetric 一个检索后端的健康度指标（与面板「引擎健康度」同源）。
+type SearchEngineMetric struct {
+	Backend             string
+	Attempts            int64
+	Successes           int64
+	Failures            int64
+	ConsecutiveFailures int64
+	AvgLatencySeconds   float64
+	Healthy             bool
 }
 
 // Write 把快照写成 Prometheus 文本格式。任何错误都来自底层 Writer。
@@ -171,6 +192,55 @@ func Write(w io.Writer, s Snapshot) error {
 	e.counter("workbuddy_native_tool_repair_total",
 		"Native tool-call markup repair outcomes (DSML text -> structured tool_calls).",
 		[]label{{"result", "rejected"}}, float64(s.NativeRepairRejected))
+
+	// 搜索服务端工具：开关 / 查询量 / TTL 缓存事件 / 活跃键 / 逐引擎健康度。
+	var searchOn float64
+	if s.SearchEnabled {
+		searchOn = 1
+	}
+	e.gauge("workbuddy_search_enabled",
+		"1 when the gateway web_search server tool is enabled.", nil, searchOn)
+	e.counter("workbuddy_search_queries_total",
+		"Web search queries served by the gateway server tool (process lifetime).",
+		nil, float64(s.SearchQueries))
+	e.counter("workbuddy_search_cache_events_total",
+		"Web search TTL cache events by kind (hit skips the engine entirely).",
+		[]label{{"kind", "hit"}}, float64(s.SearchCacheHits))
+	e.counter("workbuddy_search_cache_events_total",
+		"Web search TTL cache events by kind (hit skips the engine entirely).",
+		[]label{{"kind", "miss"}}, float64(s.SearchCacheMisses))
+	e.counter("workbuddy_search_cache_events_total",
+		"Web search TTL cache events by kind (hit skips the engine entirely).",
+		[]label{{"kind", "expired"}}, float64(s.SearchCacheExpired))
+	e.counter("workbuddy_search_cache_events_total",
+		"Web search TTL cache events by kind (hit skips the engine entirely).",
+		[]label{{"kind", "evicted"}}, float64(s.SearchCacheEvicted))
+	e.gauge("workbuddy_search_cache_active_keys",
+		"Active keys in the web search TTL cache.", nil, float64(s.SearchActiveKeys))
+	for _, eng := range s.SearchEngines {
+		var healthy float64
+		if eng.Healthy {
+			healthy = 1
+		}
+		e.gauge("workbuddy_search_engine_healthy",
+			"1 when the search backend is usable (0 after repeated failures).",
+			[]label{{"backend", eng.Backend}}, healthy)
+		e.counter("workbuddy_search_engine_attempts_total",
+			"Search backend attempts that actually reached the engine (TTL hits excluded).",
+			[]label{{"backend", eng.Backend}}, float64(eng.Attempts))
+		e.counter("workbuddy_search_engine_successes_total",
+			"Successful search backend attempts.",
+			[]label{{"backend", eng.Backend}}, float64(eng.Successes))
+		e.counter("workbuddy_search_engine_failures_total",
+			"Failed search backend attempts.",
+			[]label{{"backend", eng.Backend}}, float64(eng.Failures))
+		e.gauge("workbuddy_search_engine_consecutive_failures",
+			"Consecutive failures of the search backend (suspension trigger).",
+			[]label{{"backend", eng.Backend}}, float64(eng.ConsecutiveFailures))
+		e.gauge("workbuddy_search_engine_latency_seconds_avg",
+			"Average search backend latency in seconds.",
+			[]label{{"backend", eng.Backend}}, eng.AvgLatencySeconds)
+	}
 
 	_, err := io.WriteString(w, e.render())
 	return err

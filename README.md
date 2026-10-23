@@ -947,6 +947,15 @@ Anthropic 的 `web_search` 是**服务端工具**（检索由上游执行，客�
 | `workbuddy_usage_credits_total` | counter | 上游 `usage.credit` 累计扣除 |
 | `workbuddy_cache_tokens_total{result}` | counter | 前缀缓存 `hit` / `miss` |
 | `workbuddy_tool_pairing_events_total{direction}` | counter | 出站工具配对自愈事件：`merged_adjacent` / `repacked` / `dropped_tool_call` / `dropped_tool_result`（`dropped_*` = 客户端坏历史被剔除的条目数，真实数据丢失） |
+| `workbuddy_search_enabled` | gauge | web_search 服务端工具是否启用（1/0） |
+| `workbuddy_search_queries_total` | counter | 网关执行的检索查询总数（进程累计，重启清零） |
+| `workbuddy_search_cache_events_total{kind}` | counter | TTL 缓存事件：`hit`（跳过引擎）/ `miss` / `expired` / `evicted` |
+| `workbuddy_search_cache_active_keys` | gauge | TTL 缓存当前活跃键数 |
+| `workbuddy_search_engine_healthy{backend}` | gauge | 检索后端是否可用（连续失败 3 次置 0，成功即恢复） |
+| `workbuddy_search_engine_attempts_total{backend}` | counter | 实际触达引擎的检索尝试（TTL 命中不计入） |
+| `workbuddy_search_engine_successes_total{backend}` / `failures_total` | counter | 引擎成功 / 失败尝试数 |
+| `workbuddy_search_engine_consecutive_failures{backend}` | gauge | 引擎连续失败数（熔断触发器） |
+| `workbuddy_search_engine_latency_seconds_avg{backend}` | gauge | 引擎平均延迟（秒） |
 | `workbuddy_native_tool_repair_total{result}` | counter | 原生工具调用标记还原：`seen`（识别到的标记块）/ `converted`（还原出的调用）/ `rejected`（识别到但未还原——残留风险面，建议单独告警） |
 
 指标口径刻意与既有观测**同源**（`pool.CountsDetailed` / `ServableForRealm` / `reqlog.Snapshot` / `usage.Totals`），不在渲染层另算一套——否则 `/status`、面板、`/metrics` 三处数字迟早对不上，而「哪个数字是真的」是最难查的一类问题。
@@ -1011,6 +1020,29 @@ groups:
         labels: { severity: info }
         annotations:
           summary: "出站工具配对清理剔除了 {{ $value }} 个条目（客户端坏历史），该会话上下文有损"
+```
+
+搜索链路指标（`workbuddy_search_*`）刻画检索可用性与缓存有效性：
+
+```yaml
+groups:
+  - name: workbuddy-search
+    rules:
+      # 引擎连续失败 3 次已被网关标记不可用：所有联网检索实质失效
+      - alert: WorkbuddySearchBackendDown
+        expr: workbuddy_search_enabled == 1 and max by (backend) (workbuddy_search_engine_consecutive_failures) >= 3
+        labels: { severity: warning }
+        annotations:
+          summary: "检索后端 {{ $labels.backend }} 连续失败被熔断，联网搜索不可用"
+      # 失败率高但未到熔断线：降级预警（如 SearXNG 引擎池半残）
+      - alert: WorkbuddySearchBackendFailing
+        expr: |
+          workbuddy_search_engine_attempts_total and on (backend)
+          (sum by (backend) (increase(workbuddy_search_engine_failures_total[15m]))
+             / sum by (backend) (increase(workbuddy_search_engine_attempts_total[15m]))) > 0.3
+        labels: { severity: info }
+        annotations:
+          summary: "检索后端 {{ $labels.backend }} 15m 失败率超 30%"
 ```
 
 > `merged_adjacent` / `repacked` 是**无损归一**，正常客户端（Codex Desktop 并行调用形状）上会持续出现，**不建议告警**——只在排查工具调用异常时观察。
@@ -1092,8 +1124,11 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 | **web_search 服务端工具** | `/v1/messages` 识别 Anthropic `web_search_*` 服务端工具，由网关自己执行检索（可插拔后端 searxng/brave/bing/duckduckgo/tavily），结果回填 `server_tool_use` + `web_search_tool_result` 内容块并注入出站 prompt；附 `scripts/enable-zcode-websearch.sh` | `7b83d3f` |
 | **Anthropic Messages 兼容大修** | mid-conversation `system` 原地映射、`tool_result` 支持图片块、`output_config`/`thinking` 改为映射（而非 400）、专有字段（`top_k`/`container`/`mcp_servers`/`context_management`/`service_tier`）接受并忽略、`reasoning_content`→`thinking` 块、`message_delta` 补 `input_tokens`、无法表达的内容块丢弃而非 400 | `417d5f3` `b3fe8e3` `0cd7795` `53061ab` `502246f` `0fc7e9f` `7b83d3f` |
 | **Responses / Codex 内置工具适配** | `namespace` 工具（multi_agent_v1 / mcp__node_repl）摊平为 `<ns>__<tool>` 普通 function 并在回程还原为带 `namespace` 的 item；`custom`（apply_patch）降级为单字符串参数 function 并在回程还原为 `custom_tool_call`；`web_search` 升级为服务端工具（见下条）；其余无法表达的内置工具跳过而非 400 | `b0aa7ad` `562dc7f` |
-| **Codex 深度适配** | ① 历史 item 容错：`compaction`/`context_compaction`（自动压缩后必现）、`web_search_call`、`local_shell_call`、`configuration_update`、未知新类型一律丢弃不 400——此前任一命中即**线程永久报错**；② `reasoning.effort` 翻译为上游 `reasoning_effort`（Codex 的推理档位此前静默丢失）；③ 历史 reasoning item 摘要回填 `reasoning_content`（DeepSeek 多轮工具链连续性）；④ `function_call_output.output` 结构化内容项数组拼接为文本；⑤ `parallel_tool_calls` 透传；⑥ `additional_tools` 带内工具声明并入 tools；⑦ 11115 超限**中段裁剪重试**：Codex 长会话撞上下文上限后不再整线程 400，网关按上游实测 token 数保头保尾裁中段、同请求内重试一次 | 本轮 |
-| **web_search 服务端工具（Responses 路径）** | `/v1/responses` 识别 Codex 声明的 `web_search` 工具并接入同一检索后端：出站前实际检索、结果注入出站 prompt、流首产出 `web_search_call` item（UI 可见「已联网搜索」）；查询级 TTL 缓存防 agent 工具循环重复检索（messages 路径同享缓存） | 本轮 |
+| **Codex 深度适配** | ① 历史 item 容错：`compaction`/`context_compaction`（自动压缩后必现）、`web_search_call`、`local_shell_call`、`configuration_update`、未知新类型一律丢弃不 400——此前任一命中即**线程永久报错**；② `reasoning.effort` 翻译为上游 `reasoning_effort`（Codex 的推理档位此前静默丢失）；③ 历史 reasoning item 摘要回填 `reasoning_content`（DeepSeek 多轮工具链连续性）；④ `function_call_output.output` 结构化内容项数组拼接为文本；⑤ `parallel_tool_calls` 透传；⑥ `additional_tools` 带内工具声明并入 tools；⑦ 11115 超限**中段裁剪重试**：Codex 长会话撞上下文上限后不再整线程 400，网关按上游实测 token 数保头保尾裁中段、同请求内重试一次 | `470aeea` |
+| **web_search 服务端工具（Responses 路径）** | `/v1/responses` 识别 Codex 声明的 `web_search` 工具并接入同一检索后端：出站前实际检索、结果注入出站 prompt、流首产出 `web_search_call` item（UI 可见「已联网搜索」）；查询级 TTL 缓存防 agent 工具循环重复检索（messages 路径同享缓存）。后升级为**模型主动调用模式**（见下行） | `470aeea` |
+| **Codex 回合续跑（end_turn）** | 模型以「现在做 X」过程播报收尾却未发工具调用时（DeepSeek 高发，长会话后期几乎每轮如此），给 `response.completed` 附 `end_turn:false`，Codex 自动 follow-up 让回合继续；无状态防抖：从输入历史末尾连续 assistant 消息数反推已强制次数，达 2 次即放手，防无限循环 | `47a0866` `fdcaf7b` |
+| **web_search 模型主动调用模式** | 出站 body 注入合成 `web_search` function 工具，模型自己决定搜不搜/搜什么：调用 → 网关拦截执行检索 → 结果回填重发上游（≤3 轮，单轮撞限流自动换号 ≤3 个并应用与主管线一致的冷却策略），客户端只见 `web_search_call` item 与最终输出；编码任务零搜索（旧预检索模式对整段任务书搜索的浪费点）；渲染层兜底过滤一切向客户端透出的合成调用（含标记修复还原路径），轮次耗尽降级时注入引导 system | `47a0866` `8dbbb3f` |
+| **搜索统计观测** | 面板「搜索统计」视图（查询量 / TTL 命中率 / 缓存事件 / 引擎健康度 / 最近 30 条检索记录，`8388edb`）；三协议检索路径统一接入遥测（`8dbbb3f`）；Prometheus 导出 `workbuddy_search_*` 指标族（开关 / 查询量 / 缓存事件 / 活跃键 / 逐引擎健康度与延迟，README 附示例告警规则） | `8388edb` `8dbbb3f` |
 | **输出复读检测（`features.loop_guard`）** | 流尾 768 字节完全周期性即中止该次上游读取，返回 502 + 流内 error 帧，**不罚号不轮转**（复读是模型行为，换号大概率复现）。缺省开启，可关 | `1a04658` |
 | **Prometheus `/metrics` + 可用性告警** | 手写 Prometheus 文本格式指标（零新依赖，默认关闭时 404，鉴权与 `/status` 同口径）；健康账号数跌破阈值推 webhook 告警（HMAC-SHA256 + `X-Timestamp`），推送失败不切状态、下轮重试。全部热生效 | `4ab10e5` |
 | **工具调用链路可观测** | `workbuddy_tool_pairing_events_total` / `workbuddy_native_tool_repair_total` 刻画「客户端坏历史被自愈」与「原生标记还原失败」；README 附示例 Prometheus 告警规则；`mcp_servers` 被忽略时记 WARN | `0ae7ba1` `371537c` |
