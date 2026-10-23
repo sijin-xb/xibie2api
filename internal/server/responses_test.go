@@ -556,6 +556,38 @@ data: [DONE]
 	}
 }
 
+// 工具结果之后、最终阶段尚未执行时，模型只发一段“现在创建…”的纯文本。
+// 这是过程播报，不能被标成 final_answer；否则 Codex 会把它当最终回答并结束回合。
+func TestResponsesPendingActionTextIsCommentary(t *testing.T) {
+	const pendingActionSSE = `data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"阶段 5 的验证器已成功输出 LONG_TASK_OK。现在创建阶段 6 的 complete.txt，并核对六个目标文件都存在且内容准确。"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, pendingActionSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"finish all phases"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	completed := eventsNamed(events, "response.completed")
+	if len(completed) != 1 {
+		t.Fatalf("response.completed count=%d want 1 (all=%v)", len(completed), eventNames(events))
+	}
+	resp := completed[0].data["response"].(map[string]any)
+	item := resp["output"].([]any)[0].(map[string]any)
+	if item["phase"] != "commentary" {
+		t.Fatalf("phase=%v want commentary for pending action", item["phase"])
+	}
+}
+
 func TestResponsesToolCallFragmentsMergeByCallID(t *testing.T) {
 	sse := `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_same","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":"}}]}}]}
 

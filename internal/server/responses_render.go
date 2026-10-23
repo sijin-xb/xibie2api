@@ -301,11 +301,38 @@ func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 		}
 	}
 	if fr, _ := c["finish_reason"].(string); fr != "" {
-		if err := s.flushPending("final_answer"); err != nil {
+		if err := s.flushPending(s.pendingPhase()); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// pendingPhase 区分“还在执行任务”的过程播报与真正的最终回答。上游 chat 协议
+// 没有 Responses 的 phase 字段，而模型经常先写“现在创建…”再发起下一轮工具调用；
+// 若把它标成 final_answer，Codex 会结束回合。仅在 finish_reason=stop、正文明确
+// 指向下一步动作且没有实际工具调用时使用 commentary。
+func (s *responsesSink) pendingPhase() string {
+	if len(s.toolOrder) > 0 || s.finish != "stop" {
+		return "final_answer"
+	}
+	text := strings.TrimSpace(strings.Join(s.pending, ""))
+	if text == "" || len([]rune(text)) > 240 {
+		return "final_answer"
+	}
+	markers := []string{
+		"现在创建", "现在执行", "现在运行", "现在检查", "现在写入",
+		"接下来创建", "接下来执行", "接下来运行", "接下来检查", "接下来写入",
+		"下面创建", "下面执行", "下面运行", "下面检查", "下面写入",
+		"I will now create", "I will now execute", "I will now run", "I will now check",
+		"Next, I will create", "Next, I will execute", "Next, I will run", "Next, I will check",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return "commentary"
+		}
+	}
+	return "final_answer"
 }
 
 // appendReasoning 累积思维链并发出 reasoning_summary_text.delta。
