@@ -211,17 +211,22 @@ func (h *Handler) executeSearchTool(p *turnParams, query string) ([]websearch.Re
 		return nil, errors.New("web search backend disabled")
 	}
 	if hit, ok := h.searchCache.get(query); ok {
+		h.searchTelemetry.recordCacheHit(c.Backend(), query, hit)
 		if hit.err != "" {
 			return nil, errors.New(hit.err)
 		}
 		return hit.results, nil
 	}
+	started := time.Now()
 	results, err := c.Search(context.Background(), query, 0, nil, nil)
+	latency := time.Since(started)
 	if err != nil {
 		h.searchCache.put(query, nil, err.Error())
+		h.searchTelemetry.recordAttempt(c.Backend(), query, 0, latency, err)
 		return nil, err
 	}
 	h.searchCache.put(query, results, "")
+	h.searchTelemetry.recordAttempt(c.Backend(), query, len(results), latency, nil)
 	return results, nil
 }
 
