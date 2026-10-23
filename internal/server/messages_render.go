@@ -13,10 +13,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/websearch"
 )
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,10 @@ type messagesSink struct {
 
 	toolCalls map[int]*messagesToolCall
 	toolOrder []int
+	// droppedSearchCalls 模型主动调用模式下被拦截的 web_search 调用（按上游
+	// tool_calls index）：合成工具只由网关执行，不得向客户端透出 tool_use 块
+	// ——Claude Code 无法执行该名字的工具（与 responses sink 同语义）。
+	droppedSearchCalls map[int]bool
 
 	usage  map[string]any
 	finish string
@@ -145,6 +151,20 @@ func (s *messagesSink) emitSearchPrelude() error {
 	if ws == nil {
 		return nil
 	}
+	// 模型主动调用模式：按已执行检索逐对输出（execs 由 messages_searchloop 回填）。
+	if len(ws.execs) > 0 {
+		for _, e := range ws.execs {
+			if err := s.emitSearchBlockPair(e.query, webSearchResultContentOf(e.results, e.err)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return s.emitSearchBlockPair(ws.query, webSearchResultContentOf(ws.results, ws.err))
+}
+
+// emitSearchBlockPair 发出一对 server_tool_use + web_search_tool_result 内容块。
+func (s *messagesSink) emitSearchBlockPair(query string, resultContent any) error {
 	id := "srvtoolu_" + randHex(16)
 
 	idx := s.nextIndex
@@ -157,7 +177,7 @@ func (s *messagesSink) emitSearchPrelude() error {
 	}); err != nil {
 		return err
 	}
-	partial, _ := json.Marshal(map[string]any{"query": ws.query})
+	partial, _ := json.Marshal(map[string]any{"query": query})
 	if err := s.emit("content_block_delta", map[string]any{
 		"index": idx,
 		"delta": map[string]any{"type": "input_json_delta", "partial_json": string(partial)},
@@ -174,7 +194,7 @@ func (s *messagesSink) emitSearchPrelude() error {
 		"index": ridx,
 		"content_block": map[string]any{
 			"type": "web_search_tool_result", "tool_use_id": id,
-			"content": webSearchResultContent(ws),
+			"content": resultContent,
 		},
 	}); err != nil {
 		return err
@@ -187,11 +207,15 @@ func (s *messagesSink) emitSearchPrelude() error {
 // （Anthropic 语义里「无结果」不是错误，错误码枚举也不含 no_results）；有结果 →
 // 结果数组。
 func webSearchResultContent(ws *messagesWebSearch) any {
-	if ws.err != "" {
+	return webSearchResultContentOf(ws.results, ws.err)
+}
+
+func webSearchResultContentOf(results []websearch.Result, errText string) any {
+	if errText != "" {
 		return map[string]any{"type": "web_search_tool_result_error", "error_code": "unavailable"}
 	}
-	arr := make([]any, 0, len(ws.results))
-	for _, r := range ws.results {
+	arr := make([]any, 0, len(results))
+	for _, r := range results {
 		item := map[string]any{
 			"type":              "web_search_result",
 			"url":               r.URL,
@@ -405,6 +429,19 @@ func (s *messagesSink) handleToolCall(tc map[string]any) error {
 	if v, ok := tc["index"].(float64); ok {
 		idx = int(v)
 	}
+	if s.droppedSearchCalls[idx] {
+		return nil
+	}
+	if fn, ok := tc["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); s.meta.webSearch != nil && name == searchFunctionName {
+			if s.droppedSearchCalls == nil {
+				s.droppedSearchCalls = map[int]bool{}
+			}
+			s.droppedSearchCalls[idx] = true
+			log.Printf("WARN: [server] messages: dropped leaked web_search call (index %d) from client stream", idx)
+			return nil
+		}
+	}
 	st := s.toolCalls[idx]
 	if st == nil {
 		st = &messagesToolCall{openAIIndex: idx}
@@ -554,18 +591,25 @@ func (s *messagesSink) stopReason() string {
 func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]any, error) {
 	content := make([]any, 0, 3)
 	// web_search 服务端工具：结果块前置在正文之前（与 Anthropic 非流式消息一致）。
+	// 模型主动调用模式按 execs 逐对前插；旧预检路径退回单对。
 	if ws := meta.webSearch; ws != nil {
-		id := "srvtoolu_" + randHex(16)
-		content = append(content,
-			map[string]any{
-				"type": "server_tool_use", "id": id, "name": "web_search",
-				"input": map[string]any{"query": ws.query},
-			},
-			map[string]any{
-				"type": "web_search_tool_result", "tool_use_id": id,
-				"content": webSearchResultContent(ws),
-			},
-		)
+		pairs := ws.execs
+		if len(pairs) == 0 {
+			pairs = []searchExecRecord{{query: ws.query, results: ws.results, err: ws.err}}
+		}
+		for _, e := range pairs {
+			id := "srvtoolu_" + randHex(16)
+			content = append(content,
+				map[string]any{
+					"type": "server_tool_use", "id": id, "name": "web_search",
+					"input": map[string]any{"query": e.query},
+				},
+				map[string]any{
+					"type": "web_search_tool_result", "tool_use_id": id,
+					"content": webSearchResultContentOf(e.results, e.err),
+				},
+			)
+		}
 	}
 	finish := ""
 	if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
@@ -591,6 +635,9 @@ func messagesFromAggregate(resp map[string]any, meta messagesMeta) (map[string]a
 			if fn, ok := tc["function"].(map[string]any); ok {
 				name, _ = fn["name"].(string)
 				args, _ = fn["arguments"].(string)
+			}
+			if meta.webSearch != nil && name == searchFunctionName {
+				continue
 			}
 			input, err := parseToolArguments(args)
 			if err != nil {

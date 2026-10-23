@@ -63,6 +63,10 @@ type messagesWebSearch struct {
 	results        []websearch.Result
 	err            string // 非空 = 检索失败（渲染为 web_search_tool_result_error）
 	fresh          bool   // 本次真实执行了检索（false = TTL 缓存命中）；渲染层据此决定是否产出 web_search_call item
+	// execs 模型主动调用模式下本轮请求已执行的检索（多轮）；非空时渲染层按
+	// 每次检索一对 server_tool_use + web_search_tool_result 块输出（responses
+	// 路径回放 web_search_call item 的 Anthropic 对应物）。
+	execs []searchExecRecord
 }
 
 // messagesError 归一化/读体阶段的请求级错误（映射为 Anthropic 错误信封）。
@@ -98,10 +102,18 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer st.done()
-	// web_search 服务端工具：出站前实际检索（可用模型提炼查询串，故放在 prepareTurn
-	// 之后以复用选号/realm），结果回填 meta（渲染层据此产出 server_tool_use +
-	// web_search_tool_result 内容块），并作为一条 system 消息注入出站 prompt。
+	// web_search 服务端工具。后端可用时走**模型主动调用模式**（messages_searchloop）：
+	// 注入合成 web_search function 工具，模型自己决定搜不搜——与 /v1/responses 路径
+	// 同一套循环机制；最终输出经既有渲染器还原为 Anthropic 事件（server_tool_use +
+	// web_search_tool_result 块 + 正文）。后端未启用时保留旧预检路径：渲染错误结果块。
 	if meta.webSearch != nil {
+		if h.cfg.WebSearch != nil && h.cfg.WebSearch.Enabled() {
+			if h.runMessagesSearchLoop(r.Context(), w, st, p, meta) {
+				return
+			}
+			h.runTurn(r.Context(), w, st, p)
+			return
+		}
 		h.runWebSearch(r.Context(), meta.webSearch, p)
 		p.body = injectSearchContext(p.body, meta.webSearch.results)
 	}

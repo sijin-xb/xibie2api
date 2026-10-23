@@ -13,10 +13,9 @@ import (
 )
 
 func TestWebSearchStatsEndpointTracksCacheAndEngine(t *testing.T) {
-	const querySSE = "data: {\"choices\":[{\"delta\":{\"content\":\"Go 1.24 release notes\"}}]}\n\ndata: [DONE]\n\n"
 	up, calls := newRegressionUpstream(func(n int, _ string, _ []byte) (int, string, bool) {
-		if n == 1 {
-			return http.StatusOK, querySSE, true
+		if n%2 == 1 {
+			return http.StatusOK, sseSearchToolCall, true
 		}
 		return http.StatusOK, regNonStreamSSE, true
 	})
@@ -37,11 +36,11 @@ func TestWebSearchStatsEndpointTracksCacheAndEngine(t *testing.T) {
 			t.Fatalf("search request %d: code=%d body=%s", i+1, rec.Code, rec.Body)
 		}
 	}
-	if len(*queries) != 1 || (*queries)[0] != "Go 1.24 release notes" {
-		t.Fatalf("engine queries=%v, want one generated query", *queries)
+	if len(*queries) != 1 || (*queries)[0] != "golang 1.26 release notes" {
+		t.Fatalf("engine queries=%v, want the model-issued query (TTL deduped)", *queries)
 	}
-	if len(calls()) != 3 {
-		t.Fatalf("upstream calls=%d, want query generation + two answers", len(calls()))
+	if len(calls()) != 4 {
+		t.Fatalf("upstream calls=%d, want search+answer per request x2", len(calls()))
 	}
 
 	req := httptest.NewRequest("GET", "/panel/api/search_stats", nil)
