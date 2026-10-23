@@ -365,6 +365,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
 | `model_aliases` | `[]` | **模型别名映射**（#5）：数组，元素 `{"from":"外部模型名","to":"网关目标模型名"}`。精确匹配；命中后把请求模型名替换为 `to`（可带 `cn:`/`global:` 前缀或裸名），再走既有 realm 解析与选号/策略管线。空/缺省 = 无别名（行为不变）。`from` 不得含 `:`；重复 `from`、`from` 含 `:`/空白/`*`、`to` 为空或含空白/`*`、链式别名均在启动/保存时**报错**（fail fast） |
+| `allowed_models` | `[]` | 最终模型名白名单（别名展开后、保留 `cn:`/`global:` 前缀）。空 = 不限制；非空时名单外模型在本地返回 400 `model_not_allowed`，不选号、不出站。适合限制 Harness 的后台探测，同时保留多模型手动选择 |
 | `api_keys` | `[]` | **多 API Key**：数组，元素 `{"key":"...","name":"...","models":["glm-*"],"realm":"global","enabled":true}`。每把钥匙各自限定可调用的模型（支持 `*`/`?` 通配）与出口域。空/缺省 = 不启用，鉴权完全回落顶层 `api_key`（行为逐字节不变）。配了之后顶层 `api_key` **不再放行 `/v1/*`**（退居面板后备密钥）。详见[多 API Key](#多-api-keyapi_keys) |
 | `metrics.enabled` | `false` | 是否暴露 `GET /metrics`（Prometheus 文本格式）。关闭时该路径返回 404。热生效。详见[可观测与告警](#-可观测与告警) |
 | `alerting.*` | 全关 | 账号池可用性阈值告警：`enabled` / `webhook_url` / `secret` / `min_healthy`（缺省 1）/ `cooldown`（缺省 30m）/ `interval`（缺省 1m）。缺省全关。全部热生效。详见[可观测与告警](#-可观测与告警) |

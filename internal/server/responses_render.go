@@ -108,7 +108,11 @@ type responsesSink struct {
 	msgIndex  int
 	msgOpened bool
 	msgClosed bool
+	msgPhase  string
 	msgText   strings.Builder
+	msgItems  []responsesMessageItem
+	msgSeq    int
+	pending   []string
 
 	// 思维链（上游 delta.reasoning_content）映射为独立的 reasoning item：
 	// 必须在 message item 之前，一旦正文/工具开始就结束该阶段（上游顺序如此）。
@@ -130,6 +134,11 @@ type responsesSink struct {
 	sawError     bool
 	errorCode    string
 	errorMessage string
+}
+
+type responsesMessageItem struct {
+	index int
+	item  map[string]any
 }
 
 func newResponsesSink(w io.Writer, fl http.Flusher, meta responsesMeta) *responsesSink {
@@ -278,6 +287,9 @@ func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 		}
 	}
 	if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+		if err := s.flushPending("commentary"); err != nil {
+			return err
+		}
 		for _, tci := range tcs {
 			tc, _ := tci.(map[string]any)
 			if tc == nil {
@@ -286,6 +298,11 @@ func (s *responsesSink) Chunk(frame map[string]any, _ string) error {
 			if err := s.handleToolCall(tc); err != nil {
 				return err
 			}
+		}
+	}
+	if fr, _ := c["finish_reason"].(string); fr != "" {
+		if err := s.flushPending("final_answer"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -378,31 +395,55 @@ func (s *responsesSink) completedReasoningItem() map[string]any {
 	}
 }
 
-// appendText 累积正文并在需要时打开 message item，随后发出 output_text.delta。
+// appendText 暂存正文，直到工具边界或流尾确定 phase。
 func (s *responsesSink) appendText(txt string) error {
-	if !s.msgOpened {
-		if err := s.openMessage(); err != nil {
+	s.pending = append(s.pending, txt)
+	return nil
+}
+
+func (s *responsesSink) flushPending(phase string) error {
+	if len(s.pending) == 0 {
+		return nil
+	}
+	if !s.msgOpened || s.msgClosed || s.msgPhase != phase {
+		if s.msgOpened && !s.msgClosed {
+			if err := s.closeMessage(); err != nil {
+				return err
+			}
+		}
+		if err := s.openMessage(phase); err != nil {
 			return err
 		}
 	}
-	s.msgText.WriteString(txt)
-	return s.emit("response.output_text.delta", map[string]any{
-		"item_id":       s.msgID,
-		"output_index":  s.msgIndex,
-		"content_index": 0,
-		"delta":         txt,
-		"logprobs":      []any{},
-	})
+	for _, txt := range s.pending {
+		s.msgText.WriteString(txt)
+		if err := s.emit("response.output_text.delta", map[string]any{
+			"item_id":       s.msgID,
+			"output_index":  s.msgIndex,
+			"content_index": 0,
+			"delta":         txt,
+			"logprobs":      []any{},
+		}); err != nil {
+			return err
+		}
+	}
+	s.pending = s.pending[:0]
+	return nil
 }
 
 // openMessage 打开 assistant message item（added + content_part.added）。
-func (s *responsesSink) openMessage() error {
+func (s *responsesSink) openMessage(phase string) error {
 	// 正文开始即思维链阶段结束：先闭合 reasoning item，保证 item 生命周期顺序闭合。
 	if err := s.closeReasoning(); err != nil {
 		return err
 	}
 	s.msgIndex = s.nextOutputIndex()
 	s.msgOpened = true
+	s.msgClosed = false
+	s.msgText.Reset()
+	s.msgSeq++
+	s.msgID = fmt.Sprintf("msg_%d_%s", s.msgSeq, randHex(16))
+	s.msgPhase = phase
 	if err := s.emit("response.output_item.added", map[string]any{
 		"output_index": s.msgIndex,
 		"item": map[string]any{
@@ -411,6 +452,7 @@ func (s *responsesSink) openMessage() error {
 			"status":  "in_progress",
 			"role":    "assistant",
 			"content": []any{},
+			"phase":   s.msgPhase,
 		},
 	}); err != nil {
 		return err
@@ -430,6 +472,11 @@ func (s *responsesSink) openMessage() error {
 func (s *responsesSink) handleToolCall(tc map[string]any) error {
 	if err := s.closeReasoning(); err != nil {
 		return err
+	}
+	if s.msgOpened && !s.msgClosed {
+		if err := s.closeMessage(); err != nil {
+			return err
+		}
 	}
 	idx := 0
 	if v, ok := tc["index"].(float64); ok {
@@ -522,6 +569,9 @@ func (s *responsesSink) ErrorFrame(payload string) error {
 	if err := s.ensureStarted(); err != nil {
 		return err
 	}
+	if err := s.flushPending("final_answer"); err != nil {
+		return err
+	}
 	code, message := responsesErrorFromFrame(payload)
 	s.sawError = true
 	s.errorCode = code
@@ -534,6 +584,7 @@ func (s *responsesSink) ErrorFrame(payload string) error {
 // Done 收尾：关闭 message item 与所有 function_call item，随后发出唯一终态事件。
 //   - 收到过上游 error 帧（含空流兜底帧）→ response.failed（status:"failed" + error），
 //     携带已产生的部分 output；绝不发 response.completed。
+//   - finish_reason=length / content_filter → response.incomplete，保留部分 output。
 //   - 否则 → response.completed（status:"completed"）。
 //
 // 空流（未打开任何 item）时仍补一个空 message item，保证结构完整的终态。
@@ -545,10 +596,13 @@ func (s *responsesSink) Done() error {
 	if err := s.closeReasoning(); err != nil {
 		return err
 	}
+	if err := s.flushPending("final_answer"); err != nil {
+		return err
+	}
 	// 只有 reasoning item 的回合不再补空 message：output 非空，空 message 是噪声。
-	if !s.msgOpened && len(s.toolOrder) == 0 && !s.reasoningOpened {
+	if !s.msgOpened && len(s.msgItems) == 0 && len(s.toolOrder) == 0 && !s.reasoningOpened {
 		// 空流（未打开任何 item）：仍产出一个空 message item，保证结构完整的终态。
-		if err := s.openMessage(); err != nil {
+		if err := s.openMessage("final_answer"); err != nil {
 			return err
 		}
 	}
@@ -601,10 +655,31 @@ func (s *responsesSink) Done() error {
 		resp["error"] = map[string]any{"code": s.errorCode, "message": s.errorMessage}
 		return s.emit("response.failed", map[string]any{"response": resp})
 	}
+	if reason := incompleteReason(s.finish); reason != "" {
+		resp := s.responseObject("incomplete", false)
+		resp["output"] = s.finalOutput()
+		resp["usage"] = responsesUsage(s.usage)
+		resp["incomplete_details"] = map[string]any{"reason": reason}
+		return s.emit("response.incomplete", map[string]any{"response": resp})
+	}
 	resp := s.responseObject("completed", true)
 	resp["output"] = s.finalOutput()
 	resp["usage"] = responsesUsage(s.usage)
 	return s.emit("response.completed", map[string]any{"response": resp})
+}
+
+// incompleteReason 把上游未正常完成的 finish_reason 映射为 Responses 的
+// incomplete_details.reason。stop/tool_calls/空值不是 incomplete：前者是模型正常
+// 结束，tool_calls 等待客户端提交 function_call_output。
+func incompleteReason(finish string) string {
+	switch finish {
+	case "length":
+		return "max_output_tokens"
+	case "content_filter":
+		return "content_filter"
+	default:
+		return ""
+	}
 }
 
 // closeMessage 关闭 message item（output_text.done + content_part.done + output_item.done）。
@@ -628,6 +703,11 @@ func (s *responsesSink) closeMessage() error {
 	}); err != nil {
 		return err
 	}
+	s.msgItems = append(s.msgItems, responsesMessageItem{
+		index: s.msgIndex,
+		item:  s.completedMessageItem(),
+	})
+	s.msgOpened = false
 	s.msgClosed = true
 	return nil
 }
@@ -638,16 +718,7 @@ func (s *responsesSink) completedMessageItem() map[string]any {
 		"content": []any{map[string]any{
 			"type": "output_text", "text": s.msgText.String(), "annotations": []any{}, "logprobs": []any{},
 		}},
-	}
-	// Codex 用 item.phase 区分「回合最终回答」与「过程播报」：最终回答取
-	// phase=final_answer，播报取 commentary。上游 chat 协议没有这个字段，
-	// 不补则所有正文都落进 phase IS NULL 兜底，进度播报被当成正式回答。
-	// 判据：本回合出现过工具调用 → 这段正文是工具前的说明，属 commentary；
-	// 纯文本回合（无任何工具）→ 这段就是收尾，属 final_answer。
-	if len(s.toolOrder) > 0 {
-		item["phase"] = "commentary"
-	} else {
-		item["phase"] = "final_answer"
+		"phase": s.msgPhase,
 	}
 	return item
 }
@@ -702,9 +773,12 @@ func (s *responsesSink) finalOutput() []any {
 		idx  int
 		item any
 	}
-	entries := make([]entry, 0, 1+len(s.toolOrder))
+	entries := make([]entry, 0, 1+len(s.toolOrder)+len(s.msgItems))
 	if s.reasoningOpened {
 		entries = append(entries, entry{s.reasoningIndex, s.completedReasoningItem()})
+	}
+	for _, m := range s.msgItems {
+		entries = append(entries, entry{m.index, m.item})
 	}
 	if s.msgOpened {
 		entries = append(entries, entry{s.msgIndex, s.completedMessageItem()})
@@ -761,6 +835,11 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		"error":                nil,
 		"incomplete_details":   nil,
 		"usage":                nil,
+	}
+	if reason := incompleteReason(firstFinishReason(resp)); reason != "" {
+		obj["status"] = "incomplete"
+		obj["completed_at"] = nil
+		obj["incomplete_details"] = map[string]any{"reason": reason}
 	}
 
 	content := ""
@@ -831,6 +910,20 @@ func responsesFromAggregate(resp map[string]any, meta responsesMeta) map[string]
 		obj["usage"] = responsesUsage(usage)
 	}
 	return obj
+}
+
+// firstFinishReason 取聚合响应 choices[0].finish_reason；缺失或类型不对返回空串。
+func firstFinishReason(resp map[string]any) string {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return ""
+	}
+	c, _ := choices[0].(map[string]any)
+	if c == nil {
+		return ""
+	}
+	fr, _ := c["finish_reason"].(string)
+	return fr
 }
 
 // firstMessage 取聚合响应 choices[0].message。

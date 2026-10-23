@@ -58,4 +58,17 @@ func TestModelAliasesConfig(t *testing.T) {
 			t.Errorf("%s: want error, got nil", c.name)
 		}
 	}
+
+	t.Run("allowed_models_parse_and_reject_empty", func(t *testing.T) {
+		c, err := ParseConfig([]byte(`{"allowed_models":["global:deepseek-v4.1-flash"]}`))
+		if err != nil {
+			t.Fatalf("valid allowed_models rejected: %v", err)
+		}
+		if len(c.AllowedModels) != 1 || c.AllowedModels[0] != "global:deepseek-v4.1-flash" {
+			t.Fatalf("allowed_models=%v", c.AllowedModels)
+		}
+		if _, err := ParseConfig([]byte(`{"allowed_models":[""]}`)); err == nil {
+			t.Fatal("empty allowed model must fail")
+		}
+	})
 }

@@ -241,6 +241,9 @@ type Config struct {
 	// cn:/global: 前缀）。精确匹配；缺省空 = 无别名，行为与引入前一致。
 	// 校验与构建见 normalize（非法配置 fail fast，不静默忽略）。
 	ModelAliases []server.ModelAlias `json:"model_aliases,omitempty"`
+	// AllowedModels 最终模型名白名单（别名展开后、realm 前缀保留）。空 = 不限制；
+	// 非空时其他模型在网关本地 400 拒绝，不选号、不出站。
+	AllowedModels []string `json:"allowed_models,omitempty"`
 
 	// WebSearch web_search 服务端工具的检索后端（仅 /v1/messages 生效）。缺省关闭：
 	// 客户端声明 web_search 时回 web_search_tool_result_error。启用后网关自己执行
@@ -707,6 +710,11 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.AliasTable = tbl
+	for _, model := range c.AllowedModels {
+		if strings.TrimSpace(model) == "" {
+			return fmt.Errorf("allowed_models must not contain empty model names")
+		}
+	}
 	// 多 API Key 匹配表：空 = 未启用（KeyTable 为只含顶层 api_key 的表，行为不变）；
 	// 非空则逐条校验并编译（空密钥 / 重复密钥 / 非法 realm / 密钥含空白或 '*' 均
 	// fail fast——"配了但永远匹配不上"的哑配置比启动失败更难查）。

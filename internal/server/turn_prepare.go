@@ -70,6 +70,24 @@ func (h *Handler) prepareTurn(r *http.Request, body []byte, renderer turnRendere
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(effectiveModel)
 
+	if len(h.cfg.AllowedModels) > 0 {
+		allowed := false
+		for _, model := range h.cfg.AllowedModels {
+			if effectiveModel == model {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, nil, &keyDenyError{
+				status:  http.StatusBadRequest,
+				code:    "model_not_allowed",
+				param:   "model",
+				message: fmt.Sprintf("model %q is not enabled on this gateway", peek.Model),
+			}
+		}
+	}
+
 	// 多 API Key 约束（config api_keys）：模型白名单 + 出口绑定。
 	//
 	// 位置是刻意的：在「别名替换 + realm 解析之后」——此时才知道本次请求实际要哪个

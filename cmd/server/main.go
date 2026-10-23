@@ -325,18 +325,19 @@ func main() {
 		RateIPThreshold: cfg.Pool.RateIPThreshold,
 		RateIPWindow:    cfg.RateIPWindowDur,
 		Panel:           pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Live:            live,
+		Usage:           rec,
+		RequestLog:      requestLog,
+		PromptMode:      cfg.Prompt.Mode,
+		PromptText:      cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型别名表（#5）：外部模型名 → 网关目标模型名的精确匹配；nil = 无别名。
-		ModelAliases: cfg.AliasTable,
+		ModelAliases:  cfg.AliasTable,
+		AllowedModels: cfg.AllowedModels,
 		// web_search 服务端工具检索后端（nil = 未启用）。装配期构建，热改需重启。
 		WebSearch:           cfg.WebSearchClient,
 		WebSearchQueryMode:  cfg.WebSearch.QueryMode,

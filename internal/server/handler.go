@@ -105,6 +105,9 @@ type Config struct {
 	// realm 解析、选号、账号策略、脱敏、提示词改写、出站传输全部沿用既有管线。
 	// 见 alias.go。
 	ModelAliases *AliasTable
+	// AllowedModels 非空时只允许这些最终模型名（别名展开后、realm 前缀保留）。
+	// 空 = 不限制，保持旧配置行为。
+	AllowedModels []string
 
 	// WebSearch web_search 服务端工具的检索后端（可选；nil = 未启用，客户端声明
 	// web_search 时回 web_search_tool_result_error）。见 messages_websearch.go。

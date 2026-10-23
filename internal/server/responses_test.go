@@ -444,8 +444,8 @@ func TestResponsesMessagePhaseFinalAnswer(t *testing.T) {
 	}
 }
 
-// 出现工具调用的回合，正文是工具前的说明，phase 必须是 commentary。
-func TestResponsesMessagePhaseCommentaryWhenToolCalled(t *testing.T) {
+// 出现工具调用的回合，工具前正文必须是 commentary，工具后正文必须是 final_answer。
+func TestResponsesMessagePhaseAcrossToolBoundary(t *testing.T) {
 	// 正文先于工具调用出现，构造「先说明、再调工具」的真实形态。
 	const textThenToolSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"我先看看目录。\"}}]}\n\n" +
 		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_t1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls -la\\\"}\"}}]}}]}\n\n" +
@@ -462,18 +462,209 @@ func TestResponsesMessagePhaseCommentaryWhenToolCalled(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	events := parseSSEEvents(t, rec.Body.String())
+	assertResponsesMessagePhases(t, events, []string{"commentary"})
+}
+
+// 同一上游回合在工具结果之后继续输出正文时，必须拆成两个 message item：
+// 工具前是 commentary，工具后是 final_answer。合并会让 Codex 在工具前停止，
+// 或把最终回答误当成过程播报而不结束回合。
+func TestResponsesMessagePhaseSplitsAcrossToolResult(t *testing.T) {
+	const commentaryThenToolThenFinalSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"我先检查配置。\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_t1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"cat config\\\"}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"tool\",\"content\":\"配置正常。\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"最终答案是 42。\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	up, _ := staticRegressionUpstream(200, commentaryThenToolThenFinalSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	assertResponsesMessagePhases(t, events, []string{"commentary", "final_answer"})
+}
+
+// Codex 回放历史时会携带 phase。最终回答出现在工具结果之后，而输入里仍保留
+// 工具前的 commentary；响应必须保留这个边界，不能把历史 phase 当成当前正文。
+func TestResponsesMessagePhaseWithToolHistory(t *testing.T) {
+	const finalAfterToolSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"最终答案是 42。\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	up, _ := staticRegressionUpstream(200, finalAfterToolSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	body := `{"model":"glm-5.2","stream":true,"input":[` +
+		`{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"我先检查配置。"}]},` +
+		`{"type":"function_call","call_id":"call_t1","name":"exec_command","arguments":"{\"cmd\":\"cat config\"}"},` +
+		`{"type":"function_call_output","call_id":"call_t1","output":"配置正常。"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}` +
+		`]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	assertResponsesMessagePhases(t, events, []string{"final_answer"})
+}
+
+// 上游已经以 stop 正常结束当前响应时，网关必须如实结束该响应。
+// 正文是否像“接下来会……”属于模型语义，不是协议终止信号；网关自行再发一次
+// 上游请求会绕过 Codex 的回合循环，并与客户端的重试边界冲突。
+func TestResponsesStopDoesNotTriggerGatewayContinuation(t *testing.T) {
+	promised := `data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"接下来我会检查本机工具。"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	up, calls := newRegressionUpstream(func(int, string, []byte) (int, string, bool) {
+		return 200, promised, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"检查工具","tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := len(calls()); got != 1 {
+		t.Fatalf("upstream calls=%d want 1", got)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	if got := len(eventsNamed(events, "response.created")); got != 1 {
+		t.Fatalf("response.created=%d want 1; events=%v", got, eventNames(events))
+	}
+	if got := len(eventsNamed(events, "response.completed")); got != 1 {
+		t.Fatalf("response.completed=%d want 1; events=%v", got, eventNames(events))
+	}
+	var text strings.Builder
+	for _, e := range eventsNamed(events, "response.output_text.delta") {
+		text.WriteString(e.data["delta"].(string))
+	}
+	if got := text.String(); got != "接下来我会检查本机工具。" {
+		t.Fatalf("wire text=%q want original upstream text", got)
+	}
+}
+
+func TestResponsesToolCallFragmentsMergeByCallID(t *testing.T) {
+	sse := `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_same","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":"}}]}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_same","type":"function","function":{"arguments":"\"pwd\"}"}}]}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, sse, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"m","stream":true,"input":"x"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	if got := len(eventsNamed(events, "response.output_item.added")); got != 1 {
+		t.Fatalf("output_item.added=%d want 1; events=%v", got, eventNames(events))
+	}
 	resp := eventsNamed(events, "response.completed")[0].data["response"].(map[string]any)
-	for _, raw := range resp["output"].([]any) {
-		item := raw.(map[string]any)
-		if item["type"] != "message" {
+	output := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v want one function_call", output)
+	}
+	item := output[0].(map[string]any)
+	if item["call_id"] != "call_same" || item["arguments"] != `{"cmd":"pwd"}` {
+		t.Fatalf("function_call=%v", item)
+	}
+}
+
+func assertResponsesMessagePhases(t *testing.T, events []sseEvent, want []string) {
+	t.Helper()
+	added := make([]string, 0, len(want))
+	current := make(map[string]string)
+	for _, e := range eventsNamed(events, "response.output_item.added") {
+		item, _ := e.data["item"].(map[string]any)
+		if item == nil || item["type"] != "message" {
 			continue
 		}
-		if item["phase"] != "commentary" {
-			t.Fatalf("phase=%v want commentary", item["phase"])
+		phase, _ := item["phase"].(string)
+		if phase == "" {
+			t.Fatalf("added message item has no phase: %v", item)
 		}
-		return
+		added = append(added, phase)
+		if id, _ := item["id"].(string); id != "" {
+			current[id] = phase
+		}
 	}
-	t.Fatalf("no message item in output: %v", resp["output"])
+	if len(added) != len(want) {
+		t.Fatalf("added message phases=%v want %v", added, want)
+	}
+	for _, e := range eventsNamed(events, "response.output_item.updated") {
+		item, _ := e.data["item"].(map[string]any)
+		if item == nil || item["type"] != "message" {
+			continue
+		}
+		if id, _ := item["id"].(string); id != "" {
+			phase, _ := item["phase"].(string)
+			current[id] = phase
+		}
+	}
+
+	done := make([]string, 0, len(want))
+	for _, e := range eventsNamed(events, "response.output_item.done") {
+		item, _ := e.data["item"].(map[string]any)
+		if item == nil || item["type"] != "message" {
+			continue
+		}
+		phase, _ := item["phase"].(string)
+		done = append(done, phase)
+		if id, _ := item["id"].(string); id != "" && current[id] != phase {
+			t.Fatalf("done message %s phase=%q, last update=%q", id, phase, current[id])
+		}
+	}
+	if len(done) != len(want) {
+		t.Fatalf("done message phases=%v want %v", done, want)
+	}
+	for i := range want {
+		if done[i] != want[i] {
+			t.Fatalf("done message[%d] phase=%q want %q (all=%v)", i, done[i], want[i], done)
+		}
+	}
+
+	completed := eventsNamed(events, "response.completed")
+	if len(completed) != 1 {
+		t.Fatalf("response.completed count=%d", len(completed))
+	}
+	resp := completed[0].data["response"].(map[string]any)
+	var final []string
+	for _, raw := range resp["output"].([]any) {
+		item, _ := raw.(map[string]any)
+		if item == nil || item["type"] != "message" {
+			continue
+		}
+		phase, _ := item["phase"].(string)
+		final = append(final, phase)
+	}
+	if len(final) != len(want) {
+		t.Fatalf("final message phases=%v want %v", final, want)
+	}
+	for i := range want {
+		if final[i] != want[i] {
+			t.Fatalf("final message[%d] phase=%q want %q (all=%v)", i, final[i], want[i], final)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +836,106 @@ func TestResponsesStreamNormalCompleted(t *testing.T) {
 	}
 }
 
+// 上游达到 max_tokens 时必须以 response.incomplete 收尾，不能伪装成 completed。
+func TestResponsesStreamLengthIsIncomplete(t *testing.T) {
+	const lengthSSE = `data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"部分输出"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, lengthSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	incomplete := eventsNamed(events, "response.incomplete")
+	if len(incomplete) != 1 {
+		t.Fatalf("response.incomplete count=%d want 1 (all=%v)", len(incomplete), eventNames(events))
+	}
+	if last := events[len(events)-1]; last.name != "response.incomplete" {
+		t.Fatalf("terminal event=%q want response.incomplete (all=%v)", last.name, eventNames(events))
+	}
+	if n := len(eventsNamed(events, "response.completed")); n != 0 {
+		t.Fatalf("length must NOT emit response.completed (all=%v)", eventNames(events))
+	}
+	resp := incomplete[0].data["response"].(map[string]any)
+	if resp["status"] != "incomplete" {
+		t.Fatalf("status=%v want incomplete", resp["status"])
+	}
+	details, _ := resp["incomplete_details"].(map[string]any)
+	if details == nil || details["reason"] != "max_output_tokens" {
+		t.Fatalf("incomplete_details=%v want reason=max_output_tokens", resp["incomplete_details"])
+	}
+}
+
+// content_filter 同样是模型未正常完成，必须映射为 incomplete + content_filter。
+func TestResponsesStreamContentFilterIsIncomplete(t *testing.T) {
+	const filteredSSE = `data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"部分输出"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, filteredSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := parseSSEEvents(t, rec.Body.String())
+	incomplete := eventsNamed(events, "response.incomplete")
+	if len(incomplete) != 1 {
+		t.Fatalf("response.incomplete count=%d want 1 (all=%v)", len(incomplete), eventNames(events))
+	}
+	resp := incomplete[0].data["response"].(map[string]any)
+	details, _ := resp["incomplete_details"].(map[string]any)
+	if resp["status"] != "incomplete" || details == nil || details["reason"] != "content_filter" {
+		t.Fatalf("status=%v incomplete_details=%v want incomplete/content_filter",
+			resp["status"], resp["incomplete_details"])
+	}
+}
+
+func TestResponsesNonStreamLengthIsIncomplete(t *testing.T) {
+	const lengthSSE = `data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"部分输出"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+
+`
+	up, _ := staticRegressionUpstream(200, lengthSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"glm-5.2","input":"hi"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	obj := mustDecodeJSON(t, rec.Body.Bytes())
+	if obj["status"] != "incomplete" {
+		t.Fatalf("status=%v want incomplete", obj["status"])
+	}
+	details, _ := obj["incomplete_details"].(map[string]any)
+	if details == nil || details["reason"] != "max_output_tokens" {
+		t.Fatalf("incomplete_details=%v want reason=max_output_tokens", obj["incomplete_details"])
+	}
+}
+
 // errAfterReader 首次 Read 返回全部 data，随后 Read 返回 err（模拟上游流中途读错误）。
 type errAfterReader struct {
 	data []byte
@@ -767,6 +1058,32 @@ func TestResponsesModelAliasOutbound(t *testing.T) {
 	resp := mustDecodeJSON(t, rec.Body.Bytes())
 	if resp["model"] != "claude-sonnet-4-5" {
 		t.Fatalf("response model=%v want claude-sonnet-4-5 (echo client model)", resp["model"])
+	}
+}
+
+// 未列入 model_aliases 的模型必须在网关本地被拒绝：不选号、不出站、不返回可重试
+// 的 503。否则 Codex 会把一个永久无效的模型名重试到上限，表现为回合提前结束。
+func TestResponsesRejectsUnconfiguredModel(t *testing.T) {
+	up, calls := staticRegressionUpstream(200, respTextSSE, true)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		AllowedModels: []string{"global:deepseek-v4.1-flash"},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses",
+		strings.NewReader(`{"model":"gpt-5.6-luna","stream":true,"input":"hi"}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400; body=%s", rec.Code, rec.Body)
+	}
+	obj := mustDecodeJSON(t, rec.Body.Bytes())
+	errObj, _ := obj["error"].(map[string]any)
+	if errObj == nil || errObj["code"] != "model_not_allowed" {
+		t.Fatalf("error=%v want model_not_allowed", obj["error"])
+	}
+	if got := len(calls()); got != 0 {
+		t.Fatalf("upstream calls=%d want 0", got)
 	}
 }
 
